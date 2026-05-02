@@ -1,0 +1,80 @@
+name: Live Market Scanner
+
+on:
+  schedule:
+    # Every 10 minutes, Mon-Fri, 9:30am-4:00pm ET (13:30-20:00 UTC)
+    - cron: '30 13 * * 1-5'
+    - cron: '40 13 * * 1-5'
+    - cron: '50 13 * * 1-5'
+    - cron: '0 14 * * 1-5'
+    - cron: '10 14 * * 1-5'
+    - cron: '20 14 * * 1-5'
+    - cron: '30 14 * * 1-5'
+    - cron: '40 14 * * 1-5'
+    - cron: '50 14 * * 1-5'
+    - cron: '0 15 * * 1-5'
+    - cron: '10 15 * * 1-5'
+    - cron: '20 15 * * 1-5'
+    - cron: '30 15 * * 1-5'
+    - cron: '40 15 * * 1-5'
+    - cron: '50 15 * * 1-5'
+    - cron: '0 16 * * 1-5'
+    - cron: '10 16 * * 1-5'
+    - cron: '20 16 * * 1-5'
+    - cron: '30 16 * * 1-5'
+    - cron: '40 16 * * 1-5'
+    - cron: '50 16 * * 1-5'
+    - cron: '0 17 * * 1-5'
+    - cron: '10 17 * * 1-5'
+    - cron: '20 17 * * 1-5'
+    - cron: '30 17 * * 1-5'
+    - cron: '40 17 * * 1-5'
+    - cron: '50 17 * * 1-5'
+    - cron: '0 18 * * 1-5'
+    - cron: '10 18 * * 1-5'
+    - cron: '20 18 * * 1-5'
+    - cron: '30 18 * * 1-5'
+    - cron: '40 18 * * 1-5'
+    - cron: '50 18 * * 1-5'
+    - cron: '0 19 * * 1-5'
+    - cron: '10 19 * * 1-5'
+    - cron: '20 19 * * 1-5'
+    - cron: '30 19 * * 1-5'
+    - cron: '40 19 * * 1-5'
+    - cron: '50 19 * * 1-5'
+    - cron: '0 20 * * 1-5'
+  workflow_dispatch:   # allow manual trigger from GitHub UI
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install yfinance pandas numpy
+
+      - name: Run scanner
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          EMAIL_TO:  ${{ secrets.EMAIL_TO }}
+          MIN_SCORE: "45"
+        run: python scanner.py
+
+      - name: Upload scan results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scan-${{ github.run_number }}
+          path: last_scan.json
+          retention-days: 7
