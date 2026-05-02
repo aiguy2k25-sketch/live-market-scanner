@@ -1,0 +1,44 @@
+name: Pre-Market Catalyst Scanner
+
+on:
+  schedule:
+    # 8:00 AM ET = 12:00 UTC (summer DST) / 13:00 UTC (winter)
+    # Running at both to cover daylight saving time changes
+    - cron: '0 12 * * 1-5'
+    - cron: '0 13 * * 1-5'
+  workflow_dispatch:   # allow manual trigger from GitHub UI
+
+jobs:
+  premarket-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install feedparser requests beautifulsoup4 lxml tabulate colorama
+
+      - name: Run pre-market scanner
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          EMAIL_TO:  ${{ secrets.EMAIL_TO }}
+        run: |
+          cd premarket
+          python premarket_bot.py
+
+      - name: Upload scan results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: premarket-scan-${{ github.run_number }}
+          path: premarket/scan_*.txt
+          retention-days: 30
