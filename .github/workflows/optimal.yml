@@ -1,0 +1,67 @@
+name: Optimal Strategy Scanner
+
+on:
+  schedule:
+    # Every 15 minutes during market hours (Mon-Fri, 9:30am-4pm ET = 13:30-20:00 UTC)
+    # 15min interval matches the LTF entry timeframe so we catch new MSS at bar close
+    - cron: '30 13 * * 1-5'
+    - cron: '45 13 * * 1-5'
+    - cron: '0  14 * * 1-5'
+    - cron: '15 14 * * 1-5'
+    - cron: '30 14 * * 1-5'
+    - cron: '45 14 * * 1-5'
+    - cron: '0  15 * * 1-5'
+    - cron: '15 15 * * 1-5'
+    - cron: '30 15 * * 1-5'
+    - cron: '45 15 * * 1-5'
+    - cron: '0  16 * * 1-5'
+    - cron: '15 16 * * 1-5'
+    - cron: '30 16 * * 1-5'
+    - cron: '45 16 * * 1-5'
+    - cron: '0  17 * * 1-5'
+    - cron: '15 17 * * 1-5'
+    - cron: '30 17 * * 1-5'
+    - cron: '45 17 * * 1-5'
+    - cron: '0  18 * * 1-5'
+    - cron: '15 18 * * 1-5'
+    - cron: '30 18 * * 1-5'
+    - cron: '45 18 * * 1-5'
+    - cron: '0  19 * * 1-5'
+    - cron: '15 19 * * 1-5'
+    - cron: '30 19 * * 1-5'
+    - cron: '45 19 * * 1-5'
+    - cron: '0  20 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  optimal-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install yfinance pandas numpy
+
+      - name: Run Optimal Strategy scanner
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          EMAIL_TO:  ${{ secrets.EMAIL_TO }}
+        run: python optimal_scanner.py
+
+      - name: Upload scan
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: optimal-scan-${{ github.run_number }}
+          path: optimal_scan.json
+          retention-days: 7
