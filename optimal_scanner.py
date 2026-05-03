@@ -65,6 +65,9 @@ UNIVERSE = [
     "CAT","BA","GE","HON","RTX","LMT","DE",
     # China / EV
     "BABA","JD","NIO","XPEV","RIVN","LCID","F","GM",
+    # StockInvest.us Top 20 Buy List (added 2026-05)
+    "TRDA","FATE","PERI","ASIX","ROST","PUBM","SBR","SSSS","SRPT","VNOM",
+    "AAOI","FLYW","ADV","KOS","KNF","SEZL","PRAA","AUDC","JAKK",
 ]
 UNIVERSE = sorted(set(UNIVERSE))
 

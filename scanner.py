@@ -64,6 +64,9 @@ UNIVERSE = [
     "BABA","JD","PDD","BIDU","NIO","XPEV","LI","KWEB","FXI",
     # Crypto-adjacent
     "MARA","RIOT","HUT","BITF","CLSK","IBIT","FBTC","GBTC",
+    # StockInvest.us Top 20 Buy List (added 2026-05)
+    "TRDA","FATE","PERI","ASIX","ROST","PUBM","SBR","SSSS","SRPT","VNOM",
+    "AAOI","FLYW","ADV","KOS","KNF","SEZL","PRAA","AUDC","JAKK",
 ]
 UNIVERSE = sorted(set(UNIVERSE))
 
