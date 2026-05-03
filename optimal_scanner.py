@@ -14,6 +14,23 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
+try:
+    import pytz
+    ET = pytz.timezone("US/Eastern")
+except ImportError:
+    ET = None
+
+# ── TIME WINDOW GUARD ────────────────────────────────────────────────────────
+def in_scan_window():
+    """Only run between 9:30 AM and 12:30 PM ET, Mon-Fri."""
+    if ET is None:
+        return True   # fail-open if pytz unavailable
+    now_et = datetime.datetime.now(ET)
+    if now_et.weekday() >= 5:      # Sat/Sun
+        return False
+    minutes_since_open = (now_et.hour * 60 + now_et.minute) - (9 * 60 + 30)
+    return 0 <= minutes_since_open <= 180   # 9:30 AM to 12:30 PM ET (180 min window)
+
 # ── CONFIG ───────────────────────────────────────────────────────────────────
 SMTP_USER = os.environ.get("SMTP_USER", "2daysale@gmail.com")
 SMTP_PASS = os.environ.get("SMTP_PASS", "")
@@ -290,4 +307,8 @@ def send_email(setups, scan_time):
     print(f"Email sent to {EMAIL_TO}")
 
 if __name__ == "__main__":
+    if not in_scan_window():
+        now_et = datetime.datetime.now(ET).strftime("%Y-%m-%d %H:%M %Z") if ET else "unknown"
+        print(f"Outside scan window (9:30 AM – 12:30 PM ET, Mon-Fri). Now: {now_et}. Exiting.")
+        sys.exit(0)
     run_scan()
