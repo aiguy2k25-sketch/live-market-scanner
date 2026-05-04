@@ -1,29 +1,8 @@
 name: Live Market Scanner
 
 on:
-  schedule:
-    # Every 15 minutes, Mon-Fri, 9:30 AM – 12:30 PM ET (morning session only)
-    # EDT (Mar-Nov, UTC-4): 13:30-16:30 UTC
-    # EST (Nov-Mar, UTC-5): 14:30-17:30 UTC
-    # Both ranges scheduled — Python script checks ET time and exits if outside window
-    - cron: '30 13 * * 1-5'
-    - cron: '45 13 * * 1-5'
-    - cron: '0  14 * * 1-5'
-    - cron: '15 14 * * 1-5'
-    - cron: '30 14 * * 1-5'
-    - cron: '45 14 * * 1-5'
-    - cron: '0  15 * * 1-5'
-    - cron: '15 15 * * 1-5'
-    - cron: '30 15 * * 1-5'
-    - cron: '45 15 * * 1-5'
-    - cron: '0  16 * * 1-5'
-    - cron: '15 16 * * 1-5'
-    - cron: '30 16 * * 1-5'
-    - cron: '45 16 * * 1-5'
-    - cron: '0  17 * * 1-5'
-    - cron: '15 17 * * 1-5'
-    - cron: '30 17 * * 1-5'
-  workflow_dispatch:   # allow manual trigger from GitHub UI
+  # Triggered by Cloudflare Worker (trading-scheduler) — more reliable than GitHub cron
+  workflow_dispatch:
 
 jobs:
   scan:
