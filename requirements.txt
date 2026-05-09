@@ -1,3 +1,4 @@
-yfinance
-pandas
-numpy
+﻿anthropic>=0.50.0
+httpx>=0.27.0
+pydantic>=2.0.0
+
