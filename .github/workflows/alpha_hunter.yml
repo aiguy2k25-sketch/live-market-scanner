@@ -59,11 +59,11 @@ jobs:
           server_address: smtp.gmail.com
           server_port: 587
           secure: false
-          username: ${{ secrets.MAIL_USERNAME }}
-          password: ${{ secrets.MAIL_PASSWORD }}
+          username: ${{ secrets.SMTP_USER }}
+          password: ${{ secrets.SMTP_PASS }}
           subject: "Pristine Alpha — ${{ env.SCAN_DATE }} — ${{ env.FLAG_COUNT }} flag(s) / ${{ env.SWEEP_COUNT }} sweeps"
-          to: ${{ secrets.MAIL_TO }}
-          from: "Alpha Hunter <${{ secrets.MAIL_USERNAME }}>"
+          to: ${{ secrets.EMAIL_TO }}
+          from: "Alpha Hunter <${{ secrets.SMTP_USER }}>"
           html_body: file://email_summary.html
 
       # Also upload DB so you can download and query it from the Actions tab
