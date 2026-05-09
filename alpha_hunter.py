@@ -1,14 +1,14 @@
 """
-Pristine Alpha Hunter — institutional sweep scanner.
+Pristine Alpha Hunter — institutional sweep scanner (yfinance edition).
 
-Pulls large options sweeps (>$500k) from Unusual Whales, checks each against
-Perplexity for real-time news context, then has Claude reason about whether
-the flow looks like informed money with no public catalyst ("Pristine Alpha").
+Scans a universe of liquid tickers for options contracts with unusually high
+volume vs open interest — a free proxy for institutional sweep activity.
+Checks each hit against Perplexity for real-time news, then has Claude
+reason about whether it looks like informed money with no public catalyst.
 
 Environment variables:
     ANTHROPIC_API_KEY   — your Anthropic key
-    UW_API_TOKEN        — your Unusual Whales API token
-    PERPLEXITY_API_KEY  — your Perplexity API key
+    PERPLEXITY_API_KEY  — your Perplexity key
 """
 import argparse
 import asyncio
@@ -16,16 +16,39 @@ import json
 import os
 import sqlite3
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import httpx
+import yfinance as yf
 from anthropic import AsyncAnthropic
 from pydantic import BaseModel
 
-UW_BASE = "https://api.unusualwhales.com"
 PERPLEXITY_URL = "https://api.perplexity.ai/chat/completions"
 MODEL = "claude-opus-4-7"
 MAX_TOKENS = 2048
+
+# Universe of liquid tickers with active options markets
+DEFAULT_TICKERS = [
+    # Broad ETFs
+    "SPY", "QQQ", "IWM", "GLD", "TLT", "XLF", "XLE", "XLK", "XLV", "XBI",
+    # Mega-cap tech
+    "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL", "AVGO", "ORCL",
+    # Semiconductors
+    "AMD", "INTC", "MU", "QCOM", "ARM", "SMCI",
+    # Financials
+    "JPM", "GS", "BAC", "MS", "C", "WFC",
+    # Energy
+    "XOM", "CVX", "OXY",
+    # Biotech / Pharma
+    "LLY", "MRNA", "PFE", "ABBV", "REGN", "BIIB",
+    # Consumer / Retail
+    "NFLX", "COST", "WMT", "TGT",
+    # High-vol / momentum
+    "COIN", "HOOD", "PLTR", "UBER", "SNOW", "RBLX",
+    # Chinese ADRs
+    "BABA", "JD", "PDD",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +110,8 @@ def init_db(path: str) -> sqlite3.Connection:
             sentiment            TEXT,
             premium              REAL,
             size                 INTEGER,
+            open_interest        INTEGER,
+            vol_oi_ratio         REAL,
             fill_price           REAL,
             flagged_at           TEXT,
             news_context         TEXT,
@@ -105,20 +130,22 @@ def save_sweep(conn: sqlite3.Connection, sweep: dict, analysis: SweepAnalysis) -
     conn.execute("""
         INSERT OR REPLACE INTO sweeps VALUES (
             :id, :ticker, :strike, :expiry, :side, :sentiment,
-            :premium, :size, :fill_price, :flagged_at,
-            :news_context, :claude_reasoning, :catalyst_found,
+            :premium, :size, :open_interest, :vol_oi_ratio, :fill_price,
+            :flagged_at, :news_context, :claude_reasoning, :catalyst_found,
             :catalyst_description, :confidence, :pristine_alpha
         )
     """, {
         "id": sweep.get("id", ""),
         "ticker": sweep.get("ticker", ""),
         "strike": sweep.get("strike"),
-        "expiry": sweep.get("expiry_date") or sweep.get("expiry"),
-        "side": sweep.get("put_call") or sweep.get("side"),
+        "expiry": sweep.get("expiry_date"),
+        "side": sweep.get("put_call"),
         "sentiment": sweep.get("sentiment"),
-        "premium": sweep.get("total_premium") or sweep.get("premium"),
-        "size": sweep.get("size") or sweep.get("volume"),
-        "fill_price": sweep.get("price") or sweep.get("fill_price"),
+        "premium": sweep.get("total_premium"),
+        "size": sweep.get("volume"),
+        "open_interest": sweep.get("open_interest"),
+        "vol_oi_ratio": sweep.get("vol_oi_ratio"),
+        "fill_price": sweep.get("price"),
         "flagged_at": datetime.now(timezone.utc).isoformat(),
         "news_context": sweep.get("_news_context", ""),
         "claude_reasoning": analysis.reasoning,
@@ -131,45 +158,98 @@ def save_sweep(conn: sqlite3.Connection, sweep: dict, analysis: SweepAnalysis) -
 
 
 # ---------------------------------------------------------------------------
-# Step 1 — Unusual Whales sweep fetch
+# Step 1 -- yfinance options scan (no API key needed)
 # ---------------------------------------------------------------------------
 
-async def fetch_sweeps(
-    client: httpx.AsyncClient,
-    uw_token: str,
-    min_premium: float = 500_000,
+def _scan_ticker(ticker_symbol: str, min_premium: float) -> list[dict]:
+    try:
+        ticker = yf.Ticker(ticker_symbol)
+        expirations = ticker.options
+        if not expirations:
+            return []
+
+        hits = []
+        for expiry in expirations[:3]:  # next 3 expiry dates only
+            try:
+                chain = ticker.option_chain(expiry)
+            except Exception:
+                continue
+
+            for side, df in [("CALL", chain.calls), ("PUT", chain.puts)]:
+                for _, row in df.iterrows():
+                    volume = int(row.get("volume") or 0)
+                    oi = int(row.get("openInterest") or 0)
+                    if volume < 100 or oi < 1:
+                        continue
+
+                    vol_oi = volume / oi
+                    if vol_oi < 3.0:  # volume must be 3x open interest
+                        continue
+
+                    ask = float(row.get("ask") or 0)
+                    bid = float(row.get("bid") or 0)
+                    mid = (ask + bid) / 2 if (ask and bid) else (ask or bid)
+                    estimated_premium = mid * volume * 100
+
+                    if estimated_premium < min_premium:
+                        continue
+
+                    hits.append({
+                        "id": str(row.get("contractSymbol",
+                                          f"{ticker_symbol}_{expiry}_{row['strike']}_{side}")),
+                        "ticker": ticker_symbol,
+                        "put_call": side,
+                        "strike": float(row["strike"]),
+                        "expiry_date": expiry,
+                        "total_premium": round(estimated_premium, 2),
+                        "volume": volume,
+                        "open_interest": oi,
+                        "vol_oi_ratio": round(vol_oi, 2),
+                        "price": round(mid, 4),
+                        "implied_volatility": round(float(row.get("impliedVolatility") or 0), 4),
+                        "in_the_money": bool(row.get("inTheMoney", False)),
+                        "sentiment": "BULLISH" if side == "CALL" else "BEARISH",
+                    })
+        return hits
+
+    except Exception as exc:
+        print(f"  [{ticker_symbol}] skipped: {exc}")
+        return []
+
+
+async def fetch_unusual_options(
+    tickers: list[str],
+    min_premium: float,
+    top_n: int = 30,
 ) -> list[dict]:
-    headers = {"Authorization": f"Bearer {uw_token}", "Accept": "application/json"}
-    resp = await client.get(
-        f"{UW_BASE}/api/option-trades/flow-alerts",
-        headers=headers,
-        params={"limit": 100, "order": "desc"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    records = data.get("data", data) if isinstance(data, dict) else data
+    loop = asyncio.get_event_loop()
+    print(f"Scanning {len(tickers)} tickers for unusual options activity...", flush=True)
 
-    sweeps = []
-    for trade in records:
-        trade_type = (trade.get("type") or trade.get("alert_type") or "").upper()
-        if trade_type and trade_type != "SWEEP":
-            continue
-        premium = float(trade.get("total_premium") or trade.get("premium") or 0)
-        if premium >= min_premium:
-            sweeps.append(trade)
-    return sweeps
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        tasks = [
+            loop.run_in_executor(pool, _scan_ticker, t, min_premium)
+            for t in tickers
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_hits: list[dict] = []
+    for r in results:
+        if isinstance(r, list):
+            all_hits.extend(r)
+
+    all_hits.sort(key=lambda x: x["total_premium"], reverse=True)
+    return all_hits[:top_n]
 
 
 # ---------------------------------------------------------------------------
-# Step 2 — Perplexity news context
+# Step 2 -- Perplexity news context
 # ---------------------------------------------------------------------------
 
 async def get_news_context(
     client: httpx.AsyncClient,
     perplexity_key: str,
     ticker: str,
-    strike: str | float | None,
+    strike: float | None,
     expiry: str | None,
 ) -> str:
     strike_str = f" ${strike}" if strike else ""
@@ -193,17 +273,20 @@ async def get_news_context(
 
 
 # ---------------------------------------------------------------------------
-# Step 3 — Claude structured reasoning
+# Step 3 -- Claude structured reasoning
 # ---------------------------------------------------------------------------
 
 async def analyze_sweep(claude: AsyncAnthropic, sweep: dict, news_context: str) -> SweepAnalysis:
     ticker = sweep.get("ticker", "UNKNOWN")
-    premium = sweep.get("total_premium") or sweep.get("premium", 0)
-    side = sweep.get("put_call") or sweep.get("side", "unknown")
+    premium = sweep.get("total_premium", 0)
+    side = sweep.get("put_call", "?")
     strike = sweep.get("strike", "?")
-    expiry = sweep.get("expiry_date") or sweep.get("expiry", "?")
-    size = sweep.get("size") or sweep.get("volume", "?")
-    sentiment = sweep.get("sentiment", "unknown")
+    expiry = sweep.get("expiry_date", "?")
+    volume = sweep.get("volume", "?")
+    oi = sweep.get("open_interest", "?")
+    vol_oi = sweep.get("vol_oi_ratio", "?")
+    sentiment = sweep.get("sentiment", "?")
+    itm = "ITM" if sweep.get("in_the_money") else "OTM"
 
     msg = await claude.messages.create(
         model=MODEL,
@@ -211,10 +294,9 @@ async def analyze_sweep(claude: AsyncAnthropic, sweep: dict, news_context: str) 
         thinking={"type": "adaptive"},
         system=(
             "You are an expert options flow analyst. "
-            "Evaluate whether institutional sweeps represent informed trading with no public catalyst. "
-            "Be skeptical — most unusual activity has a mundane explanation. "
-            "Only flag as Pristine Alpha when premium is genuinely large (>$1M preferred) "
-            "AND the Perplexity search returns no credible catalyst."
+            "Evaluate whether unusual options activity represents informed trading with no public catalyst. "
+            "Be skeptical — high volume/OI ratios often have mundane explanations (earnings plays, hedges). "
+            "Only flag as Pristine Alpha when estimated premium is large AND news search returns nothing credible."
         ),
         output_config={
             "format": {
@@ -225,18 +307,20 @@ async def analyze_sweep(claude: AsyncAnthropic, sweep: dict, news_context: str) 
             }
         },
         messages=[{"role": "user", "content": f"""
-Analyze this institutional options sweep for "Pristine Alpha":
+Analyze this unusual options contract for "Pristine Alpha":
 
-TRADE:
-- Ticker: {ticker}
-- Side: {side.upper()} | Sentiment: {sentiment}
+CONTRACT:
+- Ticker: {ticker} | {itm}
+- Side: {side} | Sentiment: {sentiment}
 - Strike: ${strike} | Expiry: {expiry}
-- Premium: ${float(premium or 0):,.0f} | Contracts: {size}
+- Estimated Premium: ${float(premium):,.0f}
+- Volume: {volume:,} | Open Interest: {oi:,} | Vol/OI Ratio: {vol_oi}x
 
 NEWS CONTEXT (via Perplexity real-time search):
 {news_context}
 
-Is this Pristine Alpha — large premium sweep with NO identifiable public catalyst?
+Is this Pristine Alpha -- large estimated premium with NO identifiable public catalyst?
+Note: premium is estimated from mid-price x volume x 100 (not confirmed execution price).
 """.strip()}],
     )
 
@@ -252,154 +336,129 @@ def write_email_report(
     results: list[tuple[dict, SweepAnalysis]],
     min_premium: float,
     scan_time: datetime,
+    tickers_scanned: int,
 ) -> None:
     pristine = [(s, a) for s, a in results if a.is_pristine_alpha]
     others = [(s, a) for s, a in results if not a.is_pristine_alpha]
 
     def side_color(side: str) -> str:
-        s = (side or "").upper()
-        if "CALL" in s or s == "C":
-            return "#16a34a"
-        if "PUT" in s or s == "P":
-            return "#dc2626"
-        return "#6b7280"
+        return "#16a34a" if "CALL" in side.upper() else "#dc2626"
 
     def sentiment_badge(sentiment: str) -> str:
         s = (sentiment or "").upper()
         color = "#16a34a" if "BULL" in s else ("#dc2626" if "BEAR" in s else "#6b7280")
-        return f'<span style="background:{color};color:#fff;padding:2px 8px;border-radius:4px;font-size:12px;">{sentiment or "—"}</span>'
+        return (f'<span style="background:{color};color:#fff;padding:2px 8px;'
+                f'border-radius:4px;font-size:12px;">{sentiment or "?"}</span>')
 
     def sweep_row(sweep: dict, analysis: SweepAnalysis, highlight: bool) -> str:
-        ticker = sweep.get("ticker", "?")
-        premium = float(sweep.get("total_premium") or sweep.get("premium") or 0)
-        side = sweep.get("put_call") or sweep.get("side") or "?"
-        strike = sweep.get("strike", "?")
-        expiry = sweep.get("expiry_date") or sweep.get("expiry", "?")
-        size = sweep.get("size") or sweep.get("volume", "?")
-        sentiment = sweep.get("sentiment", "")
+        premium = float(sweep.get("total_premium") or 0)
+        volume = sweep.get("volume", 0)
+        oi = sweep.get("open_interest", 0)
+        vol_oi = sweep.get("vol_oi_ratio", 0)
+        side = sweep.get("put_call", "?")
         bg = "#fefce8" if highlight else "#ffffff"
-        border = "border-left: 4px solid #eab308;" if highlight else ""
-        return f"""
-        <tr style="background:{bg};{border}">
-          <td style="padding:10px 12px;font-weight:700;font-size:15px;color:#1e293b;">{ticker}</td>
-          <td style="padding:10px 12px;color:{side_color(side)};font-weight:600;">{side.upper()}</td>
-          <td style="padding:10px 12px;">${strike}</td>
-          <td style="padding:10px 12px;">{expiry}</td>
-          <td style="padding:10px 12px;font-weight:600;">${premium:,.0f}</td>
-          <td style="padding:10px 12px;">{size:,}</td>
-          <td style="padding:10px 12px;">{sentiment_badge(sentiment)}</td>
-          <td style="padding:10px 12px;color:#6b7280;font-size:13px;max-width:280px;">{analysis.reasoning[:160]}</td>
-          <td style="padding:10px 12px;text-align:center;font-weight:700;">{analysis.confidence:.0%}</td>
-        </tr>"""
+        border = "border-left:4px solid #eab308;" if highlight else ""
+        return (
+            f'<tr style="background:{bg};{border}">'
+            f'<td style="padding:10px 12px;font-weight:700;color:#1e293b;">{sweep.get("ticker","?")}</td>'
+            f'<td style="padding:10px 12px;color:{side_color(side)};font-weight:600;">{side}</td>'
+            f'<td style="padding:10px 12px;">${sweep.get("strike","?")}</td>'
+            f'<td style="padding:10px 12px;">{sweep.get("expiry_date","?")}</td>'
+            f'<td style="padding:10px 12px;font-weight:600;">${premium:,.0f}</td>'
+            f'<td style="padding:10px 12px;">{volume:,}</td>'
+            f'<td style="padding:10px 12px;">{oi:,}</td>'
+            f'<td style="padding:10px 12px;font-weight:600;">{vol_oi}x</td>'
+            f'<td style="padding:10px 12px;">{sentiment_badge(sweep.get("sentiment",""))}</td>'
+            f'<td style="padding:10px 12px;color:#6b7280;font-size:13px;max-width:240px;">'
+            f'{analysis.reasoning[:140]}</td>'
+            f'<td style="padding:10px 12px;text-align:center;font-weight:700;">'
+            f'{analysis.confidence:.0%}</td>'
+            f'</tr>'
+        )
 
-    pristine_rows = "".join(sweep_row(s, a, True) for s, a in pristine)
-    other_rows = "".join(sweep_row(s, a, False) for s, a in others)
+    thead = (
+        '<thead><tr style="background:{color};">'
+        '<th style="padding:10px 12px;text-align:left;">Ticker</th>'
+        '<th style="padding:10px 12px;text-align:left;">Side</th>'
+        '<th style="padding:10px 12px;text-align:left;">Strike</th>'
+        '<th style="padding:10px 12px;text-align:left;">Expiry</th>'
+        '<th style="padding:10px 12px;text-align:left;">Est. Premium</th>'
+        '<th style="padding:10px 12px;text-align:left;">Volume</th>'
+        '<th style="padding:10px 12px;text-align:left;">OI</th>'
+        '<th style="padding:10px 12px;text-align:left;">Vol/OI</th>'
+        '<th style="padding:10px 12px;text-align:left;">Sentiment</th>'
+        '<th style="padding:10px 12px;text-align:left;">Claude Reasoning</th>'
+        '<th style="padding:10px 12px;text-align:center;">Conf.</th>'
+        '</tr></thead>'
+    )
 
-    no_flags_msg = ""
-    if not pristine:
-        no_flags_msg = """
-        <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:20px;text-align:center;color:#15803d;margin-bottom:24px;">
-          <strong>No Pristine Alpha signals today.</strong> All large sweeps had identifiable catalysts or insufficient premium.
-        </div>"""
+    def table(rows_html: str, color: str) -> str:
+        hdr = thead.replace("{color}", color)
+        return (
+            '<div style="border:1px solid #e2e8f0;border-radius:8px;overflow-x:auto;margin-bottom:24px;">'
+            '<table width="100%" cellpadding="0" cellspacing="0" '
+            'style="border-collapse:collapse;font-family:sans-serif;font-size:13px;">'
+            f'{hdr}<tbody>{rows_html}</tbody></table></div>'
+        )
 
-    pristine_section = ""
-    if pristine:
-        pristine_section = f"""
-        <h2 style="color:#92400e;margin:0 0 12px;">&#11088; Pristine Alpha Flags ({len(pristine)})</h2>
-        <div style="background:#fef3c7;border:1px solid #fcd34d;border-radius:8px;padding:4px;margin-bottom:24px;overflow-x:auto;">
-          <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-family:sans-serif;font-size:14px;">
-            <thead>
-              <tr style="background:#fbbf24;">
-                <th style="padding:10px 12px;text-align:left;">Ticker</th>
-                <th style="padding:10px 12px;text-align:left;">Side</th>
-                <th style="padding:10px 12px;text-align:left;">Strike</th>
-                <th style="padding:10px 12px;text-align:left;">Expiry</th>
-                <th style="padding:10px 12px;text-align:left;">Premium</th>
-                <th style="padding:10px 12px;text-align:left;">Size</th>
-                <th style="padding:10px 12px;text-align:left;">Sentiment</th>
-                <th style="padding:10px 12px;text-align:left;">Claude Reasoning</th>
-                <th style="padding:10px 12px;text-align:center;">Conf.</th>
-              </tr>
-            </thead>
-            <tbody>{pristine_rows}</tbody>
-          </table>
-        </div>"""
+    scan_dt = scan_time.strftime("%A, %B %d %Y at %H:%M UTC")
+    no_flags = "" if pristine else (
+        '<div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;'
+        'padding:20px;text-align:center;color:#15803d;margin-bottom:24px;">'
+        '<strong>No Pristine Alpha signals today.</strong> '
+        'All high-volume contracts had identifiable catalysts.</div>'
+    )
+    pristine_section = (
+        f'<h2 style="color:#92400e;margin:0 0 12px;">&#11088; Pristine Alpha Flags ({len(pristine)})</h2>'
+        + table("".join(sweep_row(s, a, True) for s, a in pristine), "#fbbf24")
+    ) if pristine else ""
+    other_section = (
+        f'<h2 style="color:#475569;margin:0 0 12px;">All Other Hits Analyzed ({len(others)})</h2>'
+        + table("".join(sweep_row(s, a, False) for s, a in others), "#f1f5f9")
+    ) if others else ""
 
-    other_section = ""
-    if others:
-        other_section = f"""
-        <h2 style="color:#475569;margin:0 0 12px;">All Other Sweeps Scanned ({len(others)})</h2>
-        <div style="border:1px solid #e2e8f0;border-radius:8px;padding:4px;overflow-x:auto;">
-          <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-family:sans-serif;font-size:13px;">
-            <thead>
-              <tr style="background:#f1f5f9;">
-                <th style="padding:8px 12px;text-align:left;">Ticker</th>
-                <th style="padding:8px 12px;text-align:left;">Side</th>
-                <th style="padding:8px 12px;text-align:left;">Strike</th>
-                <th style="padding:8px 12px;text-align:left;">Expiry</th>
-                <th style="padding:8px 12px;text-align:left;">Premium</th>
-                <th style="padding:8px 12px;text-align:left;">Size</th>
-                <th style="padding:8px 12px;text-align:left;">Sentiment</th>
-                <th style="padding:8px 12px;text-align:left;">Claude Reasoning</th>
-                <th style="padding:8px 12px;text-align:center;">Conf.</th>
-              </tr>
-            </thead>
-            <tbody>{other_rows}</tbody>
-          </table>
-        </div>"""
-
-    scan_dt = scan_time.strftime("%A, %B %-d %Y at %-I:%M %p CST")
     html = f"""<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<html><head><meta charset="utf-8"></head>
 <body style="margin:0;padding:0;background:#f8fafc;font-family:system-ui,sans-serif;">
-  <div style="max-width:900px;margin:32px auto;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.08);">
-
-    <!-- Header -->
-    <div style="background:linear-gradient(135deg,#0f172a 0%,#1e3a5f 100%);padding:28px 32px;">
-      <h1 style="margin:0;color:#f8fafc;font-size:22px;font-weight:700;">&#128200; Pristine Alpha Hunter</h1>
-      <p style="margin:6px 0 0;color:#94a3b8;font-size:14px;">{scan_dt}</p>
-    </div>
-
-    <!-- Summary bar -->
-    <div style="display:flex;gap:0;border-bottom:1px solid #e2e8f0;">
-      <div style="flex:1;padding:20px 24px;text-align:center;border-right:1px solid #e2e8f0;">
-        <div style="font-size:28px;font-weight:700;color:#1e293b;">{len(results)}</div>
-        <div style="font-size:12px;color:#64748b;margin-top:4px;">SWEEPS SCANNED</div>
-      </div>
-      <div style="flex:1;padding:20px 24px;text-align:center;border-right:1px solid #e2e8f0;">
-        <div style="font-size:28px;font-weight:700;color:#d97706;">{len(pristine)}</div>
-        <div style="font-size:12px;color:#64748b;margin-top:4px;">PRISTINE ALPHA FLAGS</div>
-      </div>
-      <div style="flex:1;padding:20px 24px;text-align:center;">
-        <div style="font-size:28px;font-weight:700;color:#1e293b;">${min_premium/1e6:.1f}M+</div>
-        <div style="font-size:12px;color:#64748b;margin-top:4px;">PREMIUM THRESHOLD</div>
-      </div>
-    </div>
-
-    <!-- Body -->
-    <div style="padding:28px 32px;">
-      {no_flags_msg}
-      {pristine_section}
-      {other_section}
-    </div>
-
-    <!-- Footer -->
-    <div style="background:#f1f5f9;padding:16px 32px;border-top:1px solid #e2e8f0;">
-      <p style="margin:0;font-size:12px;color:#94a3b8;">
-        Powered by Unusual Whales &bull; Perplexity Sonar &bull; Claude Opus 4.7 &bull;
-        Not financial advice. Do your own due diligence.
-      </p>
-    </div>
-
+<div style="max-width:980px;margin:32px auto;background:#fff;border-radius:12px;
+     overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.08);">
+  <div style="background:linear-gradient(135deg,#0f172a,#1e3a5f);padding:28px 32px;">
+    <h1 style="margin:0;color:#f8fafc;font-size:22px;">&#128200; Pristine Alpha Hunter</h1>
+    <p style="margin:6px 0 0;color:#94a3b8;font-size:14px;">{scan_dt} &bull; yfinance data source</p>
   </div>
-</body>
-</html>"""
+  <div style="display:flex;border-bottom:1px solid #e2e8f0;">
+    <div style="flex:1;padding:20px 24px;text-align:center;border-right:1px solid #e2e8f0;">
+      <div style="font-size:28px;font-weight:700;color:#1e293b;">{tickers_scanned}</div>
+      <div style="font-size:12px;color:#64748b;margin-top:4px;">TICKERS SCANNED</div>
+    </div>
+    <div style="flex:1;padding:20px 24px;text-align:center;border-right:1px solid #e2e8f0;">
+      <div style="font-size:28px;font-weight:700;color:#1e293b;">{len(results)}</div>
+      <div style="font-size:12px;color:#64748b;margin-top:4px;">UNUSUAL CONTRACTS</div>
+    </div>
+    <div style="flex:1;padding:20px 24px;text-align:center;border-right:1px solid #e2e8f0;">
+      <div style="font-size:28px;font-weight:700;color:#d97706;">{len(pristine)}</div>
+      <div style="font-size:12px;color:#64748b;margin-top:4px;">PRISTINE ALPHA FLAGS</div>
+    </div>
+    <div style="flex:1;padding:20px 24px;text-align:center;">
+      <div style="font-size:28px;font-weight:700;color:#1e293b;">${min_premium/1e3:.0f}K+</div>
+      <div style="font-size:12px;color:#64748b;margin-top:4px;">PREMIUM THRESHOLD</div>
+    </div>
+  </div>
+  <div style="padding:28px 32px;">
+    {no_flags}{pristine_section}{other_section}
+  </div>
+  <div style="background:#f1f5f9;padding:16px 32px;border-top:1px solid #e2e8f0;">
+    <p style="margin:0;font-size:12px;color:#94a3b8;">
+      Data: Yahoo Finance (free, no API key) &bull; Context: Perplexity Sonar
+      &bull; Analysis: Claude Opus 4.7<br>
+      Est. premium = mid-price &times; volume &times; 100. Not financial advice.
+    </p>
+  </div>
+</div>
+</body></html>"""
 
     with open("email_summary.html", "w", encoding="utf-8") as f:
         f.write(html)
-
-    # Write metadata so the workflow can set the email subject
     with open("scan_meta.env", "w") as f:
         f.write(f"FLAG_COUNT={len(pristine)}\n")
         f.write(f"SWEEP_COUNT={len(results)}\n")
@@ -410,12 +469,8 @@ def write_email_report(
 # Orchestration
 # ---------------------------------------------------------------------------
 
-async def run_scan(min_premium: float, db_path: str) -> None:
-    uw_token = os.environ.get("UW_API_TOKEN", "").strip()
+async def run_scan(min_premium: float, db_path: str, tickers: list[str]) -> None:
     perplexity_key = os.environ.get("PERPLEXITY_API_KEY", "").strip()
-    if not uw_token:
-        print("Error: UW_API_TOKEN is not set.", file=sys.stderr)
-        sys.exit(1)
     if not perplexity_key:
         print("Error: PERPLEXITY_API_KEY is not set.", file=sys.stderr)
         sys.exit(1)
@@ -425,25 +480,26 @@ async def run_scan(min_premium: float, db_path: str) -> None:
     scan_time = datetime.now(timezone.utc)
     results: list[tuple[dict, SweepAnalysis]] = []
 
+    sweeps = await fetch_unusual_options(tickers, min_premium)
+    print(f"Found {len(sweeps)} unusual contracts above ${min_premium:,.0f} est. premium\n")
+
+    if not sweeps:
+        print("Nothing matched. Try lowering --min-premium.")
+        write_email_report([], min_premium, scan_time, len(tickers))
+        conn.close()
+        return
+
     async with httpx.AsyncClient() as http:
-        print(f"Fetching sweeps >= ${min_premium:,.0f}...", end=" ", flush=True)
-        sweeps = await fetch_sweeps(http, uw_token, min_premium)
-        print(f"{len(sweeps)} found")
-
-        if not sweeps:
-            print("No sweeps matched the filter.")
-            write_email_report([], min_premium, scan_time)
-            conn.close()
-            return
-
         for i, sweep in enumerate(sweeps, 1):
-            ticker = sweep.get("ticker", "?")
-            premium = float(sweep.get("total_premium") or sweep.get("premium") or 0)
-            side = (sweep.get("put_call") or sweep.get("side") or "?").upper()
-            strike = sweep.get("strike", "?")
-            expiry = sweep.get("expiry_date") or sweep.get("expiry", "?")
+            ticker = sweep["ticker"]
+            side = sweep["put_call"]
+            strike = sweep["strike"]
+            expiry = sweep["expiry_date"]
+            premium = sweep["total_premium"]
+            vol_oi = sweep["vol_oi_ratio"]
 
-            print(f"\n[{i}/{len(sweeps)}] {ticker} {side} ${strike} exp {expiry} -- ${premium:,.0f}")
+            print(f"[{i}/{len(sweeps)}] {ticker} {side} ${strike} exp {expiry} "
+                  f"-- est. ${premium:,.0f} | Vol/OI {vol_oi}x")
 
             print("  -> Perplexity...", end=" ", flush=True)
             news = await get_news_context(http, perplexity_key, ticker, strike, expiry)
@@ -452,7 +508,6 @@ async def run_scan(min_premium: float, db_path: str) -> None:
 
             print("  -> Claude...", end=" ", flush=True)
             analysis = await analyze_sweep(claude, sweep, news)
-
             flag = "*** PRISTINE ALPHA ***" if analysis.is_pristine_alpha else "  no flag"
             print(f"{flag} ({analysis.confidence:.0%})")
 
@@ -460,19 +515,20 @@ async def run_scan(min_premium: float, db_path: str) -> None:
             results.append((sweep, analysis))
 
     conn.close()
-    write_email_report(results, min_premium, scan_time)
-
+    write_email_report(results, min_premium, scan_time, len(tickers))
     pristine_count = sum(1 for _, a in results if a.is_pristine_alpha)
-    print(f"\nScan complete. {pristine_count}/{len(results)} Pristine Alpha flags.")
-    print(f"DB: {db_path} | Email: email_summary.html")
+    print(f"\nDone. {pristine_count}/{len(results)} Pristine Alpha flags.")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Pristine Alpha Hunter")
+    parser = argparse.ArgumentParser(description="Pristine Alpha Hunter (yfinance)")
     parser.add_argument("--min-premium", type=float, default=500_000, metavar="DOLLARS")
     parser.add_argument("--db", default="alpha_sweeps.db", metavar="PATH")
+    parser.add_argument("--tickers", nargs="*", default=None,
+                        help="Custom ticker list (default: built-in ~50 liquid names)")
     args = parser.parse_args()
-    asyncio.run(run_scan(args.min_premium, args.db))
+    tickers = args.tickers if args.tickers else DEFAULT_TICKERS
+    asyncio.run(run_scan(args.min_premium, args.db, tickers))
 
 
 if __name__ == "__main__":

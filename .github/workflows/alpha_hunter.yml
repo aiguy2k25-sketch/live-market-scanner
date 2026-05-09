@@ -43,7 +43,6 @@ jobs:
       - name: Run scanner
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          UW_API_TOKEN: ${{ secrets.UW_API_TOKEN }}
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
         run: |
           MIN="${{ github.event.inputs.min_premium || '500000' }}"
