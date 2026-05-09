@@ -1,13 +1,11 @@
 name: Pristine Alpha Hunter
 
 on:
-  # Run at market open and mid-day on US trading days (Mon–Fri)
-  # Times in UTC: 14:30 = 9:30 ET open, 17:00 = 12:00 ET midday
+  # 8:00 AM CST = 14:00 UTC (CST is UTC-6)
+  # During CDT (summer, UTC-5) this fires at 9:00 AM — adjust to 13:00 if preferred
   schedule:
-    - cron: "30 14 * * 1-5"   # 9:30 AM ET — market open sweep
-    - cron: "0 17 * * 1-5"    # 12:00 PM ET — midday sweep
-    - cron: "55 20 * * 1-5"   # 3:55 PM ET — end-of-day sweep
-  # Also allow manual runs from the Actions tab
+    - cron: "0 14 * * 1-5"
+  # Manual trigger from the Actions tab
   workflow_dispatch:
     inputs:
       min_premium:
@@ -33,7 +31,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # Restore the database from the previous run so history accumulates
+      # Restore accumulated database from previous runs
       - name: Restore database cache
         uses: actions/cache@v4
         with:
@@ -48,14 +46,33 @@ jobs:
           UW_API_TOKEN: ${{ secrets.UW_API_TOKEN }}
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
         run: |
-          MIN_PREMIUM="${{ github.event.inputs.min_premium || '500000' }}"
-          python alpha_hunter.py --min-premium "$MIN_PREMIUM" --db alpha_sweeps.db
+          MIN="${{ github.event.inputs.min_premium || '500000' }}"
+          python alpha_hunter.py --min-premium "$MIN" --db alpha_sweeps.db
 
-      # Upload the DB as an artifact so you can download and inspect it
-      - name: Upload results
+      # Load FLAG_COUNT, SWEEP_COUNT, SCAN_DATE into env for the subject line
+      - name: Load scan metadata
+        run: cat scan_meta.env >> "$GITHUB_ENV"
+
+      - name: Send email report
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          secure: false
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "Pristine Alpha — ${{ env.SCAN_DATE }} — ${{ env.FLAG_COUNT }} flag(s) / ${{ env.SWEEP_COUNT }} sweeps"
+          to: ${{ secrets.MAIL_TO }}
+          from: "Alpha Hunter <${{ secrets.MAIL_USERNAME }}>"
+          html_body: file://email_summary.html
+
+      # Also upload DB so you can download and query it from the Actions tab
+      - name: Upload database artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: alpha-sweeps-${{ github.run_number }}
-          path: alpha_sweeps.db
+          path: |
+            alpha_sweeps.db
+            email_summary.html
           retention-days: 30
