@@ -1,16 +1,19 @@
 """
 Alpha Scanner
-Fetches top 10 pre-market gainers + news catalysts from Alpha Vantage
-and emails results via Gmail SMTP at 8 AM CST weekdays.
+Fetches top pre-market gainers + news catalysts from Alpha Vantage.
+Filters out penny/illiquid stocks. Falls back to Yahoo Finance RSS for news.
+Emails results via Gmail SMTP at 8 AM CST weekdays.
 """
 
 import os
 import smtplib
 import sys
 import traceback
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import parsedate_to_datetime
 
 import requests
 
@@ -22,28 +25,41 @@ SMTP_PORT = int(os.environ.get("SMTP_PORT") or "587")
 SMTP_USER = os.environ.get("SMTP_USER") or ""
 SMTP_PASS = os.environ.get("SMTP_PASS") or ""
 EMAIL_TO  = os.environ.get("EMAIL_TO")  or "2daysale@gmail.com"
-TOP_N     = 10
-AV_BASE   = "https://www.alphavantage.co/query"
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+TOP_N      = 10
+MIN_PRICE  = 1.00      # filter out sub-$1 stocks
+MIN_VOLUME = 200_000   # filter out illiquid stocks
+AV_BASE    = "https://www.alphavantage.co/query"
+
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; AlphaScanner/1.0)"}
+
+# ── Date helpers ──────────────────────────────────────────────────────────────
 
 def fmt_date(dt: datetime) -> str:
-    """Cross-platform date string without leading zero on day."""
     return f"{dt.strftime('%A, %B')} {dt.day}, {dt.year}"
 
 def fmt_date_short(dt: datetime) -> str:
     return f"{dt.strftime('%b')} {dt.day}"
 
 def fmt_av_time(ts: str) -> str:
-    """Convert Alpha Vantage timestamp 20240115T143000 → readable string."""
+    """Alpha Vantage format: 20240115T143000"""
     if not ts or len(ts) < 15:
         return ""
     try:
-        dt = datetime(
-            int(ts[0:4]), int(ts[4:6]), int(ts[6:8]),
-            int(ts[9:11]), int(ts[11:13]),
-            tzinfo=timezone.utc,
-        )
+        dt = datetime(int(ts[0:4]), int(ts[4:6]), int(ts[6:8]),
+                      int(ts[9:11]), int(ts[11:13]), tzinfo=timezone.utc)
+        hour = dt.hour % 12 or 12
+        ampm = "AM" if dt.hour < 12 else "PM"
+        return f"{dt.strftime('%b')} {dt.day}, {hour}:{dt.minute:02d} {ampm} UTC"
+    except Exception:
+        return ""
+
+def fmt_rss_time(rfc2822: str) -> str:
+    """RFC 2822 format from Yahoo RSS: Mon, 11 May 2026 14:30:00 +0000"""
+    if not rfc2822:
+        return ""
+    try:
+        dt = parsedate_to_datetime(rfc2822).astimezone(timezone.utc)
         hour = dt.hour % 12 or 12
         ampm = "AM" if dt.hour < 12 else "PM"
         return f"{dt.strftime('%b')} {dt.day}, {hour}:{dt.minute:02d} {ampm} UTC"
@@ -53,34 +69,51 @@ def fmt_av_time(ts: str) -> str:
 # ── Alpha Vantage ─────────────────────────────────────────────────────────────
 
 def av_get(params: dict) -> dict:
-    params = dict(params)
-    params["apikey"] = AV_KEY
-    print(f"[AV] GET function={params.get('function')}")
-    resp = requests.get(AV_BASE, params=params, timeout=20)
+    p = dict(params)
+    p["apikey"] = AV_KEY
+    print(f"[AV] GET function={p.get('function')}")
+    resp = requests.get(AV_BASE, params=p, timeout=20, headers=HEADERS)
     resp.raise_for_status()
     data = resp.json()
     if "Error Message" in data:
         raise ValueError(f"Alpha Vantage Error Message: {data['Error Message']}")
     if "Information" in data:
-        print(f"[AV] Premium endpoint notice: {data['Information'][:200]}")
+        print(f"[AV] Premium notice: {data['Information'][:200]}")
         return {}
     if "Note" in data:
-        print(f"[AV] Rate limit Note: {data['Note'][:200]}")
+        print(f"[AV] Rate limit: {data['Note'][:200]}")
         return {}
     return data
 
 
 def fetch_top_gainers() -> list[dict]:
     data = av_get({"function": "TOP_GAINERS_LOSERS"})
-    gainers = data.get("top_gainers", [])[:TOP_N]
-    print(f"[AV] top_gainers returned: {len(gainers)} stocks")
-    if gainers:
-        for g in gainers:
-            print(f"    {g.get('ticker')} +{g.get('change_percentage')} vol={g.get('volume')}")
-    return gainers
+    all_gainers = data.get("top_gainers", [])
+
+    filtered = []
+    for s in all_gainers:
+        try:
+            price  = float(s.get("price", 0) or 0)
+            volume = int(s.get("volume", 0) or 0)
+        except (ValueError, TypeError):
+            continue
+        if price < MIN_PRICE:
+            print(f"  [FILTER] {s.get('ticker')} skipped — price ${price:.4f} < ${MIN_PRICE}")
+            continue
+        if volume < MIN_VOLUME:
+            print(f"  [FILTER] {s.get('ticker')} skipped — volume {volume:,} < {MIN_VOLUME:,}")
+            continue
+        filtered.append(s)
+        if len(filtered) >= TOP_N:
+            break
+
+    print(f"[AV] {len(all_gainers)} gainers → {len(filtered)} after price/volume filter")
+    for g in filtered:
+        print(f"  {g.get('ticker')} +{g.get('change_percentage')} ${g.get('price')} vol={int(g.get('volume',0) or 0):,}")
+    return filtered
 
 
-def fetch_news(tickers: list[str]) -> dict[str, list[dict]]:
+def fetch_av_news(tickers: list[str]) -> dict[str, list[dict]]:
     data = av_get({
         "function": "NEWS_SENTIMENT",
         "tickers": ",".join(tickers),
@@ -97,12 +130,64 @@ def fetch_news(tickers: list[str]) -> dict[str, list[dict]]:
                     "url":       article.get("url", ""),
                     "summary":   article.get("summary", ""),
                     "source":    article.get("source", ""),
-                    "published": article.get("time_published", ""),
+                    "time_str":  fmt_av_time(article.get("time_published", "")),
                     "sentiment": float(ts.get("ticker_sentiment_score", 0)),
                 })
-    total_news = sum(len(v) for v in by_ticker.values())
-    print(f"[AV] news articles matched: {total_news} across {len(tickers)} tickers")
+    total = sum(len(v) for v in by_ticker.values())
+    print(f"[AV] News matched: {total} articles across {len(tickers)} tickers")
     return by_ticker
+
+# ── Yahoo Finance RSS fallback ────────────────────────────────────────────────
+
+def fetch_yahoo_news(ticker: str) -> list[dict]:
+    url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US"
+    try:
+        resp = requests.get(url, timeout=10, headers=HEADERS)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+        channel = root.find("channel")
+        items = channel.findall("item") if channel is not None else []
+        articles = []
+        for item in items[:3]:
+            title = item.findtext("title", "").strip()
+            link  = item.findtext("link", "").strip()
+            desc  = item.findtext("description", "").strip()
+            pub   = item.findtext("pubDate", "").strip()
+            if title:
+                articles.append({
+                    "title":     title,
+                    "url":       link,
+                    "summary":   desc,
+                    "source":    "Yahoo Finance",
+                    "time_str":  fmt_rss_time(pub),
+                    "sentiment": 0.0,
+                })
+        print(f"[Yahoo] {ticker}: {len(articles)} articles")
+        return articles
+    except Exception as e:
+        print(f"[Yahoo] {ticker} failed: {e}")
+        return []
+
+
+def fetch_all_news(gainers: list[dict]) -> dict[str, list[dict]]:
+    tickers = [s["ticker"] for s in gainers]
+
+    # 1. Try Alpha Vantage for all tickers at once
+    try:
+        av_news = fetch_av_news(tickers)
+    except Exception as e:
+        print(f"[WARN] AV news failed: {e} — falling back to Yahoo for all")
+        av_news = {t: [] for t in tickers}
+
+    # 2. For any ticker with no AV news, try Yahoo Finance RSS
+    final: dict[str, list[dict]] = {}
+    for ticker in tickers:
+        articles = av_news.get(ticker, [])
+        if not articles:
+            articles = fetch_yahoo_news(ticker)
+        final[ticker] = articles
+
+    return final
 
 # ── Email builder ─────────────────────────────────────────────────────────────
 
@@ -126,16 +211,21 @@ def build_html(gainers: list[dict], news_map: dict[str, list[dict]]) -> str:
         if articles:
             news_html = ""
             for n in articles:
-                sent  = n["sentiment"]
+                sent  = n.get("sentiment", 0)
                 label = "🟢 Bullish" if sent > 0.15 else "🔴 Bearish" if sent < -0.15 else "⚪ Neutral"
-                summ  = (n["summary"] or "")[:240]
-                if len(n["summary"] or "") > 240:
+                summ  = (n.get("summary") or "")[:240]
+                if len(n.get("summary") or "") > 240:
                     summ += "…"
+                source_badge = (
+                    '<span style="background:#f57c00;color:#fff;font-size:10px;padding:1px 6px;border-radius:8px;margin-left:6px;">Yahoo Finance</span>'
+                    if n.get("source") == "Yahoo Finance" else ""
+                )
                 news_html += f"""
                 <div style="border-left:3px solid #1565c0;padding:6px 0 6px 12px;margin:10px 0;">
                   <a href="{n['url']}" style="color:#1565c0;text-decoration:none;font-weight:600;font-size:13px;">{n['title']}</a>
+                  {source_badge}
                   <p style="margin:4px 0 2px;color:#555;font-size:12px;line-height:1.5;">{summ}</p>
-                  <small style="color:#888;">{n['source']} &nbsp;•&nbsp; {fmt_av_time(n['published'])} &nbsp;•&nbsp; {label}</small>
+                  <small style="color:#888;">{n['source']} &nbsp;•&nbsp; {n.get('time_str','')} &nbsp;•&nbsp; {label}</small>
                 </div>"""
         else:
             news_html = '<p style="color:#999;font-style:italic;font-size:13px;margin:0;">No recent news found.</p>'
@@ -171,7 +261,8 @@ def build_html(gainers: list[dict], news_map: dict[str, list[dict]]) -> str:
     <div style="background:linear-gradient(135deg,#0d47a1 0%,#1976d2 100%);border-radius:12px;padding:28px 24px;text-align:center;margin-bottom:6px;">
       <div style="font-size:32px;margin-bottom:8px;">📈</div>
       <h1 style="color:#fff;margin:0;font-size:26px;font-weight:800;letter-spacing:-0.5px;">Alpha Scanner</h1>
-      <p style="color:#90caf9;margin:8px 0 0;font-size:14px;">Top {TOP_N} Pre-Market Movers &nbsp;•&nbsp; {date_str}</p>
+      <p style="color:#90caf9;margin:8px 0 0;font-size:14px;">Top {len(gainers)} Pre-Market Movers &nbsp;•&nbsp; {date_str}</p>
+      <p style="color:#bbdefb;margin:4px 0 0;font-size:12px;">Min price ${MIN_PRICE:.2f} &nbsp;•&nbsp; Min volume {MIN_VOLUME:,}</p>
     </div>
     <p style="color:#aaa;font-size:11px;text-align:center;margin:10px 0 18px;line-height:1.6;">
       For informational purposes only. Not financial advice.<br>
@@ -180,7 +271,7 @@ def build_html(gainers: list[dict], news_map: dict[str, list[dict]]) -> str:
     {cards}
     <div style="text-align:center;margin-top:28px;padding-top:16px;border-top:1px solid #ddd;">
       <p style="color:#bbb;font-size:11px;margin:0;line-height:1.8;">
-        Alpha Scanner &nbsp;•&nbsp; Powered by Alpha Vantage &nbsp;•&nbsp; Delivered at 8:00 AM CST
+        Alpha Scanner &nbsp;•&nbsp; Alpha Vantage + Yahoo Finance &nbsp;•&nbsp; Delivered at 8:00 AM CST
       </p>
     </div>
   </div>
@@ -198,16 +289,16 @@ def build_text(gainers: list[dict], news_map: dict[str, list[dict]]) -> str:
             f"${s.get('price','')}  Vol: {int(s.get('volume', 0) or 0):,}"
         )
         for n in news_map.get(ticker, []):
-            lines.append(f"  • {n['title']}")
+            lines.append(f"  • [{n['source']}] {n['title']}")
             lines.append(f"    {n['url']}")
         lines.append("")
-    lines.append("Data: Alpha Vantage | Not financial advice")
+    lines.append("Data: Alpha Vantage + Yahoo Finance | Not financial advice")
     return "\n".join(lines)
 
 # ── Email sender ──────────────────────────────────────────────────────────────
 
 def send_email(subject: str, html: str, text: str) -> None:
-    print(f"[SMTP] Connecting to {SMTP_HOST}:{SMTP_PORT} as {SMTP_USER or '(no user set)'}")
+    print(f"[SMTP] Connecting to {SMTP_HOST}:{SMTP_PORT} as {SMTP_USER or '(no user)'}")
     if not SMTP_USER or not SMTP_PASS:
         raise ValueError("SMTP_USER or SMTP_PASS is empty — check GitHub secrets")
 
@@ -239,7 +330,7 @@ def save_results(text: str) -> None:
 
 def main() -> None:
     print(f"[Alpha Scanner] Starting — {datetime.now().isoformat()}")
-    print(f"[Alpha Scanner] AV key ending: ...{AV_KEY[-4:]}")
+    print(f"[Alpha Scanner] AV key: ...{AV_KEY[-4:]}  |  Min price: ${MIN_PRICE}  |  Min vol: {MIN_VOLUME:,}")
 
     try:
         gainers = fetch_top_gainers()
@@ -249,16 +340,10 @@ def main() -> None:
         sys.exit(1)
 
     if not gainers:
-        print("[Alpha Scanner] No gainers returned — possibly rate limited or market closed. Exiting.")
-        sys.exit(0)  # not an error, just nothing to report
+        print("[Alpha Scanner] No qualifying gainers found — market may be closed or rate limited.")
+        sys.exit(0)
 
-    tickers = [s["ticker"] for s in gainers]
-
-    try:
-        news_map = fetch_news(tickers)
-    except Exception as e:
-        print(f"[WARN] fetch_news failed: {e} — continuing without news")
-        news_map = {t: [] for t in tickers}
+    news_map = fetch_all_news(gainers)
 
     html = build_html(gainers, news_map)
     text = build_text(gainers, news_map)
