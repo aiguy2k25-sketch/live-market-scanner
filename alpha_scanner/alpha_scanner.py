@@ -16,12 +16,12 @@ import requests
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-AV_KEY    = os.environ.get("ALPHA_VANTAGE_KEY", "NKEQJ0HERGZIQL0S")
-SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER = os.environ.get("SMTP_USER", "")
-SMTP_PASS = os.environ.get("SMTP_PASS", "")
-EMAIL_TO  = os.environ.get("EMAIL_TO",  "2daysale@gmail.com")
+AV_KEY    = os.environ.get("ALPHA_VANTAGE_KEY") or "NKEQJ0HERGZIQL0S"
+SMTP_HOST = os.environ.get("SMTP_HOST") or "smtp.gmail.com"
+SMTP_PORT = int(os.environ.get("SMTP_PORT") or "587")
+SMTP_USER = os.environ.get("SMTP_USER") or ""
+SMTP_PASS = os.environ.get("SMTP_PASS") or ""
+EMAIL_TO  = os.environ.get("EMAIL_TO")  or "2daysale@gmail.com"
 TOP_N     = 10
 AV_BASE   = "https://www.alphavantage.co/query"
 
