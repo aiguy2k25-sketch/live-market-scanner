@@ -29,10 +29,10 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*70}")
-    print(f" QUANTITATIVE SCANNER  —  {dt.datetime.now():%Y-%m-%d %H:%M:%S}")
+    print(f" QUANTITATIVE SCANNER  -  {dt.datetime.now():%Y-%m-%d %H:%M:%S}")
     print(f"{'='*70}\n")
 
-    result = run_scanner(progress_cb=lambda msg: print(f"  · {msg}"))
+    result = run_scanner(progress_cb=lambda msg: print(f"  - {msg}"))
 
     print()
     for note in result.notes:
@@ -40,26 +40,24 @@ def main() -> int:
     print()
 
     if result.disabled:
-        print("  ⛔  Scanner disabled. Nothing to surface.\n")
-        # Still write an empty marker file so the workflow has something to attach
+        print("  Scanner disabled. Nothing to surface.\n")
         marker = out_dir / f"scan_{dt.date.today():%Y%m%d}_DISABLED.txt"
         marker.write_text(
-            f"Scanner disabled — macro composite {result.score:.1f} "
+            f"Scanner disabled - macro composite {result.score:.1f} "
             f"({result.zone}).\n"
         )
         return 0
 
     df = result.df.head(args.top)
 
-    # Pretty print
     display_cols = [
         "price", "composite",
         "score_1_momentum", "score_2_vol_surge",
-        "score_3_rs", "score_4_high_prox", "score_5_short",
+        "score_3_rs", "score_4_high_prox", "score_5_inst",
     ]
     pretty = df[display_cols].copy()
     pretty.columns = ["Price", "Composite",
-                      "Momentum", "Vol Surge", "RS", "52w Hi", "Short"]
+                      "Momentum", "Vol Surge", "RS", "52w Hi", "Inst%"]
     pretty = pretty.round(1)
     print(f"  Top {len(pretty)} of {result.universe_size} universe:\n")
     print(pretty.to_string())
@@ -71,14 +69,13 @@ def main() -> int:
         print(f"    - {k:<40} {v:>4} ({pct:.0f}%)")
     print()
 
-    # Save full + top-N CSVs
     today = dt.date.today()
     full_path = out_dir / f"scan_{today:%Y%m%d}_full.csv"
     top_path = out_dir / f"scan_{today:%Y%m%d}_top{args.top}.csv"
     result.df.to_csv(full_path)
     df.to_csv(top_path)
-    print(f"  💾  Saved: {full_path}")
-    print(f"  💾  Saved: {top_path}\n")
+    print(f"  Saved: {full_path}")
+    print(f"  Saved: {top_path}\n")
 
     return 0
 
