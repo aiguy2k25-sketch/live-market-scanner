@@ -53,23 +53,21 @@ def get_sp500_tickers() -> list[str]:
     """
     return _cached_sp500()
 
-
 @lru_cache(maxsize=1)
 def _cached_sp500() -> tuple[str, ...]:
     """Fetch S&P 500 constituents.
 
     Strategy:
       1. Try the datasets/s-and-p-500-companies GitHub CSV (reliable from
-         any IP, community-maintained, updates weekly).
+         any IP including GitHub Actions runners).
       2. Fall back to Wikipedia with a UA header.
-      3. Fall back to a static frozen list if all network calls fail.
     """
     import io
     import urllib.request
 
     headers = {"User-Agent": "Mozilla/5.0 (compatible; daily-quant/1.0)"}
 
-    # Attempt 1: GitHub-hosted CSV (most reliable for CI)
+    # Attempt 1: GitHub-hosted CSV (most reliable for CI environments)
     try:
         url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
         req = urllib.request.Request(url, headers=headers)
@@ -97,7 +95,7 @@ def _cached_sp500() -> tuple[str, ...]:
 
     raise RuntimeError(
         "Could not fetch S&P 500 constituent list from any source."
-    )
+    )  )
 
 def percentile_rank(series: pd.Series, value: float) -> float:
     """Return the percentile (0-100) of `value` within `series`."""
