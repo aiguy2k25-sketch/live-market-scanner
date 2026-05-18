@@ -56,12 +56,49 @@ def get_sp500_tickers() -> list[str]:
 
 @lru_cache(maxsize=1)
 def _cached_sp500() -> tuple[str, ...]:
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    tables = pd.read_html(url)
-    tickers = tables[0]["Symbol"].tolist()
-    # Yahoo uses '-' where Wikipedia uses '.' (BRK.B -> BRK-B)
-    tickers = [t.replace(".", "-") for t in tickers]
-    return tuple(tickers)
+    """Fetch S&P 500 constituents.
+
+    Try Wikipedia first with a real user-agent header (raw pd.read_html
+    gets 403'd from data center IPs like GitHub Actions). Fall back to
+    GitHub's mirror of the list maintained by datasets/s-and-p-500.
+    """
+    import io
+    import urllib.request
+
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; daily-quant/1.0)"}
+
+    # Attempt 1: Wikipedia with proper headers
+    try:
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8")
+        tables = pd.read_html(io.StringIO(html))
+        tickers = tables[0]["Symbol"].tolist()
+        tickers = [t.replace(".", "-") for t in tickers]
+        if len(tickers) >= 450:
+            return tuple(tickers)
+    except Exception:
+        pass
+
+    # Attempt 2: GitHub-hosted CSV mirror (community-maintained)
+    try:
+        url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = resp.read().decode("utf-8")
+        df = pd.read_csv(io.StringIO(data))
+        # Column is named 'Symbol' in this dataset
+        tickers = [t.replace(".", "-") for t in df["Symbol"].tolist()]
+        if len(tickers) >= 450:
+            return tuple(tickers)
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "Could not fetch S&P 500 constituent list from any source. "
+        "Check network or supply a static list."
+    )
 
 
 def percentile_rank(series: pd.Series, value: float) -> float:
