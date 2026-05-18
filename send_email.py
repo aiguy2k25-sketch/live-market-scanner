@@ -1,11 +1,4 @@
-"""Compose and send the daily scanner email.
-
-Reads CSVs produced by run_scanner.py and sends a formatted HTML email via
-SMTP. Credentials come from environment variables (set as GitHub secrets):
-  - GMAIL_USER       (the sending Gmail address)
-  - GMAIL_APP_PASSWORD  (Gmail App Password, not your account password)
-  - EMAIL_TO         (recipient — defaults to 2daysale@gmail.com)
-"""
+"""Compose and send the daily scanner email."""
 from __future__ import annotations
 
 import datetime as dt
@@ -28,8 +21,7 @@ DEFAULT_TO = "2daysale@gmail.com"
 TOP_N = 25
 
 
-def _read_today_csv(results_dir: Path) -> tuple[pd.DataFrame | None, Path | None, bool]:
-    """Returns (df_or_None, csv_path_or_None, disabled_flag)."""
+def _read_today_csv(results_dir: Path):
     today = dt.date.today()
     disabled = list(results_dir.glob(f"scan_{today:%Y%m%d}_DISABLED.txt"))
     if disabled:
@@ -37,7 +29,6 @@ def _read_today_csv(results_dir: Path) -> tuple[pd.DataFrame | None, Path | None
 
     full = results_dir / f"scan_{today:%Y%m%d}_full.csv"
     if not full.exists():
-        # Fallback: most recent scan file
         candidates = sorted(results_dir.glob("scan_*_full.csv"))
         if not candidates:
             return None, None, False
@@ -53,18 +44,18 @@ def _render_html(df: pd.DataFrame, disabled: bool, disabled_msg: str = "") -> st
         return f"""
         <html><body style="font-family: -apple-system, sans-serif; background: #0b0e17;
                             color: #e5e7eb; padding: 24px;">
-          <h2 style="color: #ef4444">⛔ Scanner Disabled</h2>
+          <h2 style="color: #ef4444">Scanner Disabled</h2>
           <p>{disabled_msg}</p>
           <p style="color: #9ca3af; font-size: 13px">{today}</p>
         </body></html>
         """
 
     top = df.head(TOP_N).copy()
-   cols = ["price", "composite", "score_1_momentum", "score_2_vol_surge",
-            "score_3_rs", "score_4_high_prox", "score_5_short"]
+    cols = ["price", "composite", "score_1_momentum", "score_2_vol_surge",
+            "score_3_rs", "score_4_high_prox", "score_5_inst"]
     top = top[cols].round(1)
     top.columns = ["Price", "Composite", "Momentum", "Vol Surge",
-                   "RS", "52w Hi", "Short"]
+                   "RS", "52w Hi", "Inst%"]
 
     rows = []
     for ticker, row in top.iterrows():
@@ -82,7 +73,7 @@ def _render_html(df: pd.DataFrame, disabled: bool, disabled_msg: str = "") -> st
     return f"""
     <html><body style="font-family:-apple-system,sans-serif; background:#0b0e17;
                        color:#e5e7eb; padding:24px; max-width:900px; margin:auto">
-      <h2 style="margin:0">🔎 Daily Scanner Results</h2>
+      <h2 style="margin:0">Daily Scanner Results</h2>
       <p style="color:#9ca3af; margin-top:4px">{today}</p>
 
       <p>Top {TOP_N} of {len(df)} ranked S&amp;P 500 names by 5-factor composite.</p>
@@ -106,7 +97,7 @@ def _render_html(df: pd.DataFrame, disabled: bool, disabled_msg: str = "") -> st
             <th style='padding:8px 10px; text-align:right; color:#9ca3af;
                        font-size:12px; letter-spacing:1px'>52W</th>
             <th style='padding:8px 10px; text-align:right; color:#9ca3af;
-                       font-size:12px; letter-spacing:1px'>SHORT</th>
+                       font-size:12px; letter-spacing:1px'>INST%</th>
           </tr>
         </thead>
         <tbody>{table_rows}</tbody>
@@ -114,7 +105,7 @@ def _render_html(df: pd.DataFrame, disabled: bool, disabled_msg: str = "") -> st
 
       <p style="color:#9ca3af; font-size:12px; margin-top:18px">
         Full ranked CSV attached. Methodology: each factor is percentile-ranked
-        across the universe (0–100); composite is the equal-weighted mean.
+        across the universe (0-100); composite is the equal-weighted mean.
         Gated by the macro deployment score.
       </p>
       <p style="color:#9ca3af; font-size:11px">
@@ -130,14 +121,14 @@ def send_email(html: str, attachment: Path | None = None) -> None:
     to_addr = os.environ.get("EMAIL_TO", DEFAULT_TO)
 
     if not user or not password:
-        print("ERROR: GMAIL_USER and GMAIL_APP_PASSWORD must be set as env vars "
-              "(or GitHub secrets).", file=sys.stderr)
+        print("ERROR: GMAIL_USER and GMAIL_APP_PASSWORD must be set as env vars.",
+              file=sys.stderr)
         sys.exit(1)
 
     msg = MIMEMultipart("mixed")
     msg["From"] = user
     msg["To"] = to_addr
-    msg["Subject"] = (f"Scanner Results — {dt.date.today():%Y-%m-%d}")
+    msg["Subject"] = f"Scanner Results - {dt.date.today():%Y-%m-%d}"
 
     msg.attach(MIMEText(html, "html"))
 
@@ -150,12 +141,12 @@ def send_email(html: str, attachment: Path | None = None) -> None:
                         f"attachment; filename={attachment.name}")
         msg.attach(part)
 
-    print(f"Sending email to {to_addr}…")
+    print(f"Sending email to {to_addr}...")
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
         server.starttls()
         server.login(user, password)
         server.send_message(msg)
-    print("✅  Email sent.")
+    print("Email sent.")
 
 
 def main() -> int:
