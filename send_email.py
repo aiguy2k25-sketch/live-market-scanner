@@ -60,7 +60,7 @@ def _render_html(df: pd.DataFrame, disabled: bool, disabled_msg: str = "") -> st
         """
 
     top = df.head(TOP_N).copy()
-    cols = ["price", "composite", "score_1_momentum", "score_2_vol_surge",
+   cols = ["price", "composite", "score_1_momentum", "score_2_vol_surge",
             "score_3_rs", "score_4_high_prox", "score_5_short"]
     top = top[cols].round(1)
     top.columns = ["Price", "Composite", "Momentum", "Vol Surge",
