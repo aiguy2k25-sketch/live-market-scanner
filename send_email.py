@@ -1,0 +1,185 @@
+"""Compose and send the daily scanner email.
+
+Reads CSVs produced by run_scanner.py and sends a formatted HTML email via
+SMTP. Credentials come from environment variables (set as GitHub secrets):
+  - GMAIL_USER       (the sending Gmail address)
+  - GMAIL_APP_PASSWORD  (Gmail App Password, not your account password)
+  - EMAIL_TO         (recipient — defaults to 2daysale@gmail.com)
+"""
+from __future__ import annotations
+
+import datetime as dt
+import os
+import smtplib
+import sys
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email import encoders
+from pathlib import Path
+
+import pandas as pd
+
+
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 587
+
+DEFAULT_TO = "2daysale@gmail.com"
+TOP_N = 25
+
+
+def _read_today_csv(results_dir: Path) -> tuple[pd.DataFrame | None, Path | None, bool]:
+    """Returns (df_or_None, csv_path_or_None, disabled_flag)."""
+    today = dt.date.today()
+    disabled = list(results_dir.glob(f"scan_{today:%Y%m%d}_DISABLED.txt"))
+    if disabled:
+        return None, disabled[0], True
+
+    full = results_dir / f"scan_{today:%Y%m%d}_full.csv"
+    if not full.exists():
+        # Fallback: most recent scan file
+        candidates = sorted(results_dir.glob("scan_*_full.csv"))
+        if not candidates:
+            return None, None, False
+        full = candidates[-1]
+    df = pd.read_csv(full, index_col=0)
+    return df, full, False
+
+
+def _render_html(df: pd.DataFrame, disabled: bool, disabled_msg: str = "") -> str:
+    today = dt.date.today().strftime("%A, %B %d, %Y")
+
+    if disabled:
+        return f"""
+        <html><body style="font-family: -apple-system, sans-serif; background: #0b0e17;
+                            color: #e5e7eb; padding: 24px;">
+          <h2 style="color: #ef4444">⛔ Scanner Disabled</h2>
+          <p>{disabled_msg}</p>
+          <p style="color: #9ca3af; font-size: 13px">{today}</p>
+        </body></html>
+        """
+
+    top = df.head(TOP_N).copy()
+    cols = ["price", "composite", "score_1_momentum", "score_2_vol_surge",
+            "score_3_rs", "score_4_high_prox", "score_5_short"]
+    top = top[cols].round(1)
+    top.columns = ["Price", "Composite", "Momentum", "Vol Surge",
+                   "RS", "52w Hi", "Short"]
+
+    rows = []
+    for ticker, row in top.iterrows():
+        cells = "".join(
+            f"<td style='padding:6px 10px; border-bottom:1px solid #1f2436;"
+            f" text-align:right; font-variant-numeric:tabular-nums'>{v}</td>"
+            for v in row.values
+        )
+        rows.append(
+            f"<tr><td style='padding:6px 10px; border-bottom:1px solid #1f2436;"
+            f" font-weight:600'>{ticker}</td>{cells}</tr>"
+        )
+    table_rows = "\n".join(rows)
+
+    return f"""
+    <html><body style="font-family:-apple-system,sans-serif; background:#0b0e17;
+                       color:#e5e7eb; padding:24px; max-width:900px; margin:auto">
+      <h2 style="margin:0">🔎 Daily Scanner Results</h2>
+      <p style="color:#9ca3af; margin-top:4px">{today}</p>
+
+      <p>Top {TOP_N} of {len(df)} ranked S&amp;P 500 names by 5-factor composite.</p>
+
+      <table style="width:100%; border-collapse:collapse; margin-top:12px;
+                    background:#141826; border-radius:6px; overflow:hidden">
+        <thead>
+          <tr style="background:#1f2436">
+            <th style='padding:8px 10px; text-align:left; color:#9ca3af;
+                       font-size:12px; letter-spacing:1px'>TICKER</th>
+            <th style='padding:8px 10px; text-align:right; color:#9ca3af;
+                       font-size:12px; letter-spacing:1px'>PRICE</th>
+            <th style='padding:8px 10px; text-align:right; color:#9ca3af;
+                       font-size:12px; letter-spacing:1px'>COMPOSITE</th>
+            <th style='padding:8px 10px; text-align:right; color:#9ca3af;
+                       font-size:12px; letter-spacing:1px'>MOM</th>
+            <th style='padding:8px 10px; text-align:right; color:#9ca3af;
+                       font-size:12px; letter-spacing:1px'>VOL</th>
+            <th style='padding:8px 10px; text-align:right; color:#9ca3af;
+                       font-size:12px; letter-spacing:1px'>RS</th>
+            <th style='padding:8px 10px; text-align:right; color:#9ca3af;
+                       font-size:12px; letter-spacing:1px'>52W</th>
+            <th style='padding:8px 10px; text-align:right; color:#9ca3af;
+                       font-size:12px; letter-spacing:1px'>SHORT</th>
+          </tr>
+        </thead>
+        <tbody>{table_rows}</tbody>
+      </table>
+
+      <p style="color:#9ca3af; font-size:12px; margin-top:18px">
+        Full ranked CSV attached. Methodology: each factor is percentile-ranked
+        across the universe (0–100); composite is the equal-weighted mean.
+        Gated by the macro deployment score.
+      </p>
+      <p style="color:#9ca3af; font-size:11px">
+        Not investment advice. Generated by the live-market-scanner repo.
+      </p>
+    </body></html>
+    """
+
+
+def send_email(html: str, attachment: Path | None = None) -> None:
+    user = os.environ.get("GMAIL_USER")
+    password = os.environ.get("GMAIL_APP_PASSWORD")
+    to_addr = os.environ.get("EMAIL_TO", DEFAULT_TO)
+
+    if not user or not password:
+        print("ERROR: GMAIL_USER and GMAIL_APP_PASSWORD must be set as env vars "
+              "(or GitHub secrets).", file=sys.stderr)
+        sys.exit(1)
+
+    msg = MIMEMultipart("mixed")
+    msg["From"] = user
+    msg["To"] = to_addr
+    msg["Subject"] = (f"Scanner Results — {dt.date.today():%Y-%m-%d}")
+
+    msg.attach(MIMEText(html, "html"))
+
+    if attachment and attachment.exists():
+        with open(attachment, "rb") as f:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(f.read())
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition",
+                        f"attachment; filename={attachment.name}")
+        msg.attach(part)
+
+    print(f"Sending email to {to_addr}…")
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.starttls()
+        server.login(user, password)
+        server.send_message(msg)
+    print("✅  Email sent.")
+
+
+def main() -> int:
+    results_dir = Path("results")
+    if not results_dir.exists():
+        print(f"No results directory at {results_dir}", file=sys.stderr)
+        return 1
+
+    df, path, disabled = _read_today_csv(results_dir)
+
+    if disabled:
+        msg = path.read_text() if path else "Scanner disabled."
+        html = _render_html(pd.DataFrame(), disabled=True, disabled_msg=msg)
+        send_email(html, attachment=None)
+        return 0
+
+    if df is None:
+        print("No scan results found to email.", file=sys.stderr)
+        return 1
+
+    html = _render_html(df, disabled=False)
+    send_email(html, attachment=path)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

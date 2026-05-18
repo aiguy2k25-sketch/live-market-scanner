@@ -1,0 +1,46 @@
+name: Daily Scanner
+
+on:
+  schedule:
+    # 21:00 UTC = 4:00pm ET (after US close, during DST)
+    # GitHub Actions cron is always UTC. Adjust if you want winter time.
+    - cron: '0 21 * * 1-5'   # Mon-Fri after US close
+  workflow_dispatch:          # allow manual runs from the Actions tab
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scanner
+        run: python run_scanner.py --out results
+
+      - name: Send email
+        env:
+          GMAIL_USER:         ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_TO:           ${{ secrets.EMAIL_TO }}
+        run: python send_email.py
+
+      - name: Upload results as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-results-${{ github.run_id }}
+          path: results/
+          retention-days: 30

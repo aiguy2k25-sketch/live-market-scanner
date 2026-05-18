@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+.DS_Store
+.idea/
+.vscode/
+
+# Scanner output — keep the dir but ignore its contents
+results/*.csv
+results/*.txt
+!results/.gitkeep
+
+# Streamlit
+.streamlit/secrets.toml
