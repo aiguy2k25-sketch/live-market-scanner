@@ -46,12 +46,13 @@ def get_close(ticker: str, period: str = "2y") -> pd.Series:
 
 
 def get_sp500_tickers() -> list[str]:
-    """Scrape current S&P 500 constituents from Wikipedia.
+    """Scrape current S&P 500 constituents.
 
-    This isn't perfect (Wikipedia lags rebalances by a few days), but it's
-    free and good enough for a breadth signal. Cached per-process.
+    Tries the GitHub CSV mirror first (reliable from data center IPs like
+    GitHub Actions), then Wikipedia as a fallback. Cached per-process.
     """
-    return _cached_sp500()
+    return list(_cached_sp500())
+
 
 @lru_cache(maxsize=1)
 def _cached_sp500() -> tuple[str, ...]:
@@ -95,7 +96,8 @@ def _cached_sp500() -> tuple[str, ...]:
 
     raise RuntimeError(
         "Could not fetch S&P 500 constituent list from any source."
-    )  )
+    )
+
 
 def percentile_rank(series: pd.Series, value: float) -> float:
     """Return the percentile (0-100) of `value` within `series`."""
