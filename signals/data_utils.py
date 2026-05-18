@@ -99,6 +99,10 @@ def _cached_sp500() -> tuple[str, ...]:
         "Could not fetch S&P 500 constituent list from any source. "
         "Check network or supply a static list."
     )
+    raise RuntimeError(
+        "Could not fetch S&P 500 constituent list from any source. "
+        "Check network or supply a static list."
+    )
 
 
 def percentile_rank(series: pd.Series, value: float) -> float:
