@@ -2,10 +2,9 @@ name: Daily Scanner
 
 on:
   schedule:
-    # 21:00 UTC = 4:00pm ET (after US close, during DST)
-    # GitHub Actions cron is always UTC. Adjust if you want winter time.
-    - cron: '0 21 * * 1-5'   # Mon-Fri after US close
-  workflow_dispatch:          # allow manual runs from the Actions tab
+    - cron: '0 13 * * 1-5'    # 8:00 AM CT  - pre-market read (yesterday's close)
+    - cron: '30 21 * * 1-5'   # 3:30 PM CT  - 30 min after market close, data settled
+  workflow_dispatch:           # allow manual runs from the Actions tab
 
 jobs:
   scan:
