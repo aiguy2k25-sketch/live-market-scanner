@@ -2,16 +2,16 @@ name: Daily Scanner
 
 on:
   schedule:
-    # 21:00 UTC = 4:00pm ET (after US close, during DST)
-    # GitHub Actions cron is always UTC. Adjust if you want winter time.
-    - cron: '0 21 * * 1-5'   # Mon-Fri after US close
-  workflow_dispatch:          # allow manual runs from the Actions tab
+    # 13:00 UTC = 8:00 AM CT (pre-market, during CDT)
+    - cron: '0 13 * * 1-5'
+    # 20:30 UTC = 3:30 PM CT (post-close, during CDT)
+    - cron: '30 20 * * 1-5'
+  workflow_dispatch:  # allow manual runs from the Actions tab
 
 jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
@@ -32,9 +32,9 @@ jobs:
 
       - name: Send email
         env:
-          GMAIL_USER:         ${{ secrets.GMAIL_USER }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          EMAIL_TO:           ${{ secrets.EMAIL_TO }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: python send_email.py
 
       - name: Upload results as artifact
