@@ -45,7 +45,10 @@ EMAIL_TO      = os.environ.get("EMAIL_TO",   "2daysale@gmail.com")
 SMTP_HOST     = os.environ.get("SMTP_HOST",  "smtp.gmail.com")
 SMTP_PORT     = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER     = os.environ.get("SMTP_USER",  "2daysale@gmail.com")
-SMTP_PASS     = os.environ.get("SMTP_PASS",  "ocjm vexx scke fmdx")
+# SECURITY: never hard-code the app password here. The old one was committed
+# to a public repo and must be revoked at myaccount.google.com/apppasswords.
+# Set SMTP_PASS only via GitHub Actions Secrets (Settings > Secrets > Actions).
+SMTP_PASS     = os.environ.get("SMTP_PASS", "")
 
 HEADERS = {
     "User-Agent": (
@@ -92,7 +95,33 @@ CATALYST_WEIGHTS = {
 
 # --- HELPERS -----------------------------------------------------------------
 
-TICKER_RE = re.compile(r'\b([A-Z]{1,5})\b')
+import ticker_universe as TU
+
+# Tier-1 (high confidence) patterns: explicit ticker syntax in financial text.
+# Matches: $AVGO, (NASDAQ: AVGO), (NYSE: BRK.A), NYSE American: AIB, (AMEX: XYZ)
+STRONG_TICKER_RE = re.compile(
+    r'(?:\$([A-Z]{1,5})\b'
+    r'|\((?:NASDAQ|NYSE(?:\s+American)?|AMEX|OTC|CBOE)\s*:\s*([A-Z]{1,5}(?:\.[A-Z])?)\)'
+    r'|\b(?:NASDAQ|NYSE(?:\s+American)?|AMEX)\s*:\s*([A-Z]{1,5}(?:\.[A-Z])?)\b)'
+)
+
+# Tier-2 (bare word) pattern — only accepted after universe validation.
+TICKER_RE = re.compile(r'\b([A-Z]{2,5})\b')
+
+# Tickers that are also common English words / proper nouns. A bare-word match
+# on these is NOT enough — they require Tier-1 syntax ($BULL, "(NASDAQ: COCO)")
+# or their company name appearing in the same text.
+AMBIGUOUS_TICKERS = {
+    "ALL", "AN", "ARE", "BIG", "BULL", "CAKE", "CARS", "COCO", "COOL", "DASH",
+    "EAT", "EVER", "FAST", "FIVE", "FIZZ", "FLY", "FORM", "FUN", "GAIN", "GOOD",
+    "GROW", "HAS", "HEAR", "HOG", "HOPE", "HUGE", "ICE", "JACK", "JOB", "KEY",
+    "LAND", "LIFE", "LIKE", "LOVE", "MAIN", "MAX", "MIND", "NET", "NEXT", "NICE",
+    "NOW", "ONE", "OPEN", "PEAK", "PLAY", "PLUS", "PRO", "RACE", "REAL", "RIDE",
+    "ROAD", "ROCK", "ROOT", "SAFE", "SEE", "SHOP", "SITE", "SKIN", "SNOW", "SO",
+    "STEP", "TASK", "TEAM", "TECH", "TELL", "TILE", "TREE", "TRIP", "TRUE",
+    "TURN", "TWO", "VG", "WAY", "WELL", "WIRE", "WOW", "YETI", "YOU", "NP",
+    "SM", "CC", "GO", "IT", "ME", "MO", "ON", "OUT", "RUN", "SAVE", "TV",
+}
 
 # Common words to exclude from ticker detection
 EXCLUDE_WORDS = {
@@ -148,15 +177,41 @@ def score_text(text: str) -> float:
 
 
 def extract_tickers(text: str) -> list[str]:
-    found = []
+    """
+    Three-tier ticker extraction (fixes false positives like 'NFL' in an
+    Eli Manning headline, or attributing a BitGo (BTGO) lawsuit to YORK):
+
+      Tier 1: explicit syntax  ($AVGO, (NASDAQ: BTGO))  -> always accepted
+      Tier 2: bare ALL-CAPS word -> accepted only if it is a real listed
+              ticker (SEC universe) AND not an ambiguous English word
+      Tier 3: ambiguous tickers (BULL, COCO, NOW...) -> accepted only when
+              the company's actual name also appears in the text
+    """
+    found: set[str] = set()
+
+    # Tier 1 — explicit syntax wins unconditionally
+    for m in STRONG_TICKER_RE.finditer(text):
+        tk = next(g for g in m.groups() if g)
+        found.add(tk.split(".")[0])
+
+    # Tier 2 / 3 — bare words, validated against the listed universe
+    lower_text = text.lower()
     for m in TICKER_RE.finditer(text):
         t = m.group(1)
-        if t in EXCLUDE_WORDS:
+        if t in found or t in EXCLUDE_WORDS:
             continue
-        if len(t) < 2:
+        if not TU.is_valid_ticker(t):
+            continue  # not a real listed ticker -> drop (kills YORK, NFL, RCX noise)
+        if t in AMBIGUOUS_TICKERS:
+            # require the company name in the text, e.g. "Webull" for BULL
+            name = (TU.company_name_for(t) or "").lower()
+            first_word = name.split()[0] if name else ""
+            if len(first_word) >= 4 and first_word in lower_text:
+                found.add(t)
             continue
-        found.append(t)
-    return list(set(found))
+        found.add(t)
+
+    return list(found)
 
 
 def is_recent(entry_time, hours=LOOKBACK_HOURS) -> bool:
@@ -241,6 +296,7 @@ def scrape_yahoo_movers() -> list[dict]:
                         "pub": None,
                         "forced_ticker": tk,
                         "forced_score": 8 if "Gain" in name else (-6 if "Los" in name else 5),
+                        "is_mover": True,
                     })
     return items
 
@@ -321,6 +377,145 @@ def scrape_finviz_news() -> list[dict]:
         if not title or len(title) < 8:
             continue
         items.append({"source": "Finviz", "title": title, "text": title, "pub": None})
+    return items
+
+
+def scrape_finviz_movers() -> list[dict]:
+    """
+    Finviz screener: top gainers and losers (structured table -> real tickers).
+    NOTE: Finviz sometimes 403s datacenter IPs; fails gracefully if blocked.
+    """
+    items = []
+    screens = [
+        ("https://finviz.com/screener.ashx?v=111&s=ta_topgainers&f=sh_avgvol_o500,sh_price_o5",
+         "Finviz Top Gainers", 7),
+        ("https://finviz.com/screener.ashx?v=111&s=ta_toplosers&f=sh_avgvol_o500,sh_price_o5",
+         "Finviz Top Losers", -6),
+    ]
+    for url, name, base in screens:
+        r = fetch(url)
+        if not r:
+            continue
+        soup = BeautifulSoup(r.text, "lxml")
+        # screener ticker links look like: quote.ashx?t=AVGO
+        seen = set()
+        for a in soup.select('a[href*="quote.ashx?t="]'):
+            tk = a.get_text(strip=True).upper()
+            if not tk or tk in seen or len(tk) > 5 or not tk.isalpha():
+                continue
+            seen.add(tk)
+            items.append({
+                "source": name,
+                "title": f"{tk} on {name}",
+                "text": f"{tk} {name} pre-market mover",
+                "pub": None,
+                "forced_ticker": tk,
+                "forced_score": base,
+                "is_mover": True,
+            })
+            if len(seen) >= 20:
+                break
+    return items
+
+
+def scrape_stocktwits_trending() -> list[dict]:
+    """
+    StockTwits trending symbols — free public JSON API, returns clean tickers.
+    Trending on StockTwits pre-market = retail attention = intraday range.
+    """
+    items = []
+    r = fetch("https://api.stocktwits.com/api/2/trending/symbols.json")
+    if not r:
+        return items
+    try:
+        data = r.json()
+        for sym in data.get("symbols", [])[:25]:
+            tk = str(sym.get("symbol", "")).upper()
+            title = str(sym.get("title", ""))
+            if not tk or not tk.isalpha() or len(tk) > 5:
+                continue
+            items.append({
+                "source": "StockTwits Trending",
+                "title": f"{tk} trending on StockTwits ({title})",
+                "text": f"{tk} {title} trending social volume",
+                "pub": None,
+                "forced_ticker": tk,
+                "forced_score": 5,
+                "is_mover": True,
+            })
+    except Exception as e:
+        print(f"  {Fore.RED}[WARN] StockTwits parse: {e}{Style.RESET_ALL}")
+    return items
+
+
+def scrape_globenewswire_rss() -> list[dict]:
+    """GlobeNewswire — primary press-release wire (earnings, FDA, contracts)."""
+    feeds = [
+        ("https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/"
+         "GlobeNewswire%20-%20News%20about%20Public%20Companies",
+         "GlobeNewswire"),
+    ]
+    items = []
+    for url, name in feeds:
+        items += scrape_rss(url, name)
+    return items
+
+
+def scrape_accesswire_rss() -> list[dict]:
+    """Accesswire — press-release wire popular with small caps (your gappers)."""
+    feeds = [
+        ("https://www.accesswire.com/rss/latest", "Accesswire"),
+    ]
+    items = []
+    for url, name in feeds:
+        items += scrape_rss(url, name)
+    return items
+
+
+def scrape_nasdaq_rss() -> list[dict]:
+    """Nasdaq.com markets feed."""
+    feeds = [
+        ("https://www.nasdaq.com/feed/rssoutbound?category=Markets", "Nasdaq Markets"),
+        ("https://www.nasdaq.com/feed/rssoutbound?category=Earnings", "Nasdaq Earnings"),
+    ]
+    items = []
+    for url, name in feeds:
+        items += scrape_rss(url, name)
+    return items
+
+
+def scrape_finnhub_news() -> list[dict]:
+    """
+    Optional: Finnhub general news (free tier, real-time). Activates only if
+    FINNHUB_API_KEY is set as a repo secret / env var. Good real-time overlay
+    on top of your delayed Polygon data.
+    """
+    items = []
+    key = os.environ.get("FINNHUB_API_KEY", "").strip()
+    if not key:
+        return items
+    r = fetch(f"https://finnhub.io/api/v1/news?category=general&token={key}")
+    if not r:
+        return items
+    try:
+        for art in r.json()[:60]:
+            ts = art.get("datetime")
+            pub = datetime.fromtimestamp(ts, tz=timezone.utc) if ts else None
+            if pub and not is_recent(pub):
+                continue
+            title = art.get("headline", "")
+            summary = art.get("summary", "")
+            related = str(art.get("related", "")).upper()  # Finnhub gives tickers!
+            text = f"{title} {summary} {related}"
+            item = {"source": "Finnhub", "title": title, "text": text, "pub": pub}
+            # Finnhub's 'related' field is an authoritative ticker tag
+            rel = [t for t in related.split(",") if t and t.isalpha() and len(t) <= 5]
+            if len(rel) == 1:
+                item["forced_ticker"] = rel[0]
+                item["forced_score"] = score_text(text)
+            items.append(item)
+    except Exception as e:
+        print(f"  {Fore.RED}[WARN] Finnhub parse: {e}{Style.RESET_ALL}")
     return items
 
 
@@ -434,7 +629,13 @@ def scrape_sec_edgar() -> list[dict]:
             if not is_recent(pub):
                 continue
             title = getattr(entry, "title", "")
-            items.append({"source": "SEC 8-K Filings", "title": title, "text": title, "pub": pub})
+            item = {"source": "SEC 8-K Filings", "title": title, "text": title, "pub": pub}
+            # 8-K titles contain company names, not tickers — resolve via universe
+            name_hits = TU.tickers_from_company_names(title, max_hits=1)
+            if len(name_hits) == 1:
+                item["forced_ticker"] = next(iter(name_hits))
+                item["forced_score"] = 6  # material event filed
+            items.append(item)
     except Exception as e:
         print(f"  [WARN] SEC EDGAR: {e}")
     return items
@@ -451,6 +652,12 @@ def run_all_scrapers() -> list[dict]:
         ("Seeking Alpha RSS", scrape_seeking_alpha_rss),
         ("Investing.com RSS", scrape_investing_com_rss),
         ("Finviz News", scrape_finviz_news),
+        ("Finviz Movers", scrape_finviz_movers),
+        ("StockTwits Trending", scrape_stocktwits_trending),
+        ("GlobeNewswire", scrape_globenewswire_rss),
+        ("Accesswire", scrape_accesswire_rss),
+        ("Nasdaq RSS", scrape_nasdaq_rss),
+        ("Finnhub (optional)", scrape_finnhub_news),
         ("StockAnalysis", scrape_stockanalysis_news),
         ("MarketChameleon Earnings", scrape_market_chameleon_earnings),
         ("MarketChameleon IPOs", scrape_market_chameleon_ipos),
@@ -472,7 +679,8 @@ def run_all_scrapers() -> list[dict]:
 
 def aggregate_scores(items: list[dict]) -> dict:
     """
-    Returns dict: ticker -> {score, mentions, sources, headlines, catalyst_type}
+    Returns dict: ticker -> {score, mentions, sources, headlines, catalyst_type,
+                             news_sources, mover_sources}
     """
     ticker_data = defaultdict(lambda: {
         "score": 0.0,
@@ -480,7 +688,22 @@ def aggregate_scores(items: list[dict]) -> dict:
         "sources": set(),
         "headlines": [],
         "catalyst_type": set(),
+        "news_sources": set(),   # real reporting (RSS, wires, SEC)
+        "mover_sources": set(),  # lists of yesterday's movers (Yahoo/Finviz/StockTwits)
     })
+
+    # Dedupe syndicated copies of the same story (same headline via 3 feeds
+    # should not count as 3 mentions). Key = first 60 alphanumeric chars.
+    seen_keys: set[str] = set()
+    deduped = []
+    for item in items:
+        key = re.sub(r'[^a-z0-9]', '', item.get("title", "").lower())[:60]
+        if key and not item.get("is_mover"):
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+        deduped.append(item)
+    items = deduped
 
     for item in items:
         text = clean_text(item.get("text", "") + " " + item.get("title", ""))
@@ -519,6 +742,10 @@ def aggregate_scores(items: list[dict]) -> dict:
             d["score"] += forced_s + base_score * 0.3
             d["mentions"] += 1
             d["sources"].add(item["source"])
+            if item.get("is_mover"):
+                d["mover_sources"].add(item["source"])
+            else:
+                d["news_sources"].add(item["source"])
             d["catalyst_type"].update(cats)
             if item["title"] not in d["headlines"]:
                 d["headlines"].append(item["title"])
@@ -531,11 +758,13 @@ def aggregate_scores(items: list[dict]) -> dict:
 
         for tk in tickers:
             d = ticker_data[tk]
-            # Known tickers get full score; unknown get partial
-            multiplier = 1.0 if tk in KNOWN_TICKERS else 0.4
+            # Extraction is now universe-validated, so full credit; small extra
+            # weight for household names the keyword engine understands well.
+            multiplier = 1.0 if tk in KNOWN_TICKERS else 0.8
             d["score"] += base_score * multiplier
             d["mentions"] += 1
             d["sources"].add(item["source"])
+            d["news_sources"].add(item["source"])
             d["catalyst_type"].update(cats)
             if item["title"] not in d["headlines"] and len(d["headlines"]) < 3:
                 d["headlines"].append(item["title"])
@@ -546,26 +775,44 @@ def aggregate_scores(items: list[dict]) -> dict:
 def rank_tickers(ticker_data: dict, top_n=TOP_N) -> list[tuple]:
     """
     Score formula:
-      final = raw_score
-            + mention_bonus (log scale)
-            + source_diversity_bonus
-            + known_ticker_bonus
-    Returns list of (ticker, score, data) sorted best->worst by abs(score).
+      final = raw_score + mention_bonus + source_diversity_bonus + known_bonus
+              + CONFIRMED bonus (news AND mover-list -> the real gap+catalyst setup)
+      mover-list-only tickers are capped: appearing on yesterday's gainers list
+      is lagging information, not a catalyst.
+    Adds d['confirmation'] in {'CONFIRMED','NEWS','MOVER-ONLY'}.
     """
     import math
+    MOVER_ONLY_CAP = 6.0      # mover-only names can never outrank real catalysts
+    CONFIRM_BONUS = 6.0       # news + on movers list = catalyst already moving
+
     ranked = []
     for tk, d in ticker_data.items():
         if d["mentions"] < 1:
             continue
+        has_news = len(d["news_sources"]) > 0
+        has_mover = len(d["mover_sources"]) > 0
+
         raw = d["score"]
         mention_bonus = math.log1p(d["mentions"]) * 2
         source_bonus = len(d["sources"]) * 1.5
         known_bonus = 3.0 if tk in KNOWN_TICKERS else 0.0
         final = raw + mention_bonus + source_bonus + known_bonus
+
+        if has_news and has_mover:
+            d["confirmation"] = "CONFIRMED"
+            final += CONFIRM_BONUS if final >= 0 else -CONFIRM_BONUS
+        elif has_news:
+            d["confirmation"] = "NEWS"
+        else:
+            d["confirmation"] = "MOVER-ONLY"
+            # Lagging signal: cap it so it sorts below anything with a catalyst
+            final = max(min(final, MOVER_ONLY_CAP), -MOVER_ONLY_CAP)
+
         ranked.append((tk, final, d))
 
-    # Sort by absolute value of final score, descending (both big up and down moves are tradeable)
-    ranked.sort(key=lambda x: abs(x[1]), reverse=True)
+    # Sort: confirmed first, then by absolute score (big moves either way are tradeable)
+    conf_order = {"CONFIRMED": 0, "NEWS": 1, "MOVER-ONLY": 2}
+    ranked.sort(key=lambda x: (conf_order[x[2]["confirmation"]], -abs(x[1])))
     return ranked[:top_n]
 
 
@@ -683,9 +930,10 @@ def build_email_body(ranked: list[tuple]) -> tuple[str, str]:
     lines.append("-" * 72)
     for rank, (tk, score, d) in enumerate(ranked, 1):
         bias = "BULL" if score > 0 else "BEAR"
+        conf = d.get("confirmation", "")[:9]
         cat  = ", ".join(sorted(d["catalyst_type"]))[:20]
         hl   = (d["headlines"][0][:50] + "...") if d["headlines"] else ""
-        lines.append(f"#{rank:<3} {tk:<7} {score:>+7.1f}  {bias:<8}  {cat:<22}  {hl}")
+        lines.append(f"#{rank:<3} {tk:<7} {score:>+7.1f}  {bias:<5} {conf:<10} {cat:<22}  {hl}")
     lines.append("")
     lines.append("-" * 72)
     lines.append("DETAILED NOTES (top 15):")
@@ -740,12 +988,18 @@ def build_email_body(ranked: list[tuple]) -> tuple[str, str]:
         bg  = row_color(score)
         cat = ", ".join(sorted(d["catalyst_type"]))[:28]
         hl  = (d["headlines"][0][:65] + "...") if d["headlines"] else ""
+        conf = d.get("confirmation", "")
+        conf_colors = {"CONFIRMED": "#155724", "NEWS": "#0c5460", "MOVER-ONLY": "#999"}
+        conf_html = (f'<span style="color:{conf_colors.get(conf, "#999")};'
+                     f'font-weight:{"bold" if conf == "CONFIRMED" else "normal"};'
+                     f'font-size:11px">{conf}</span>')
         rows_html += f"""
         <tr style="background:{bg}">
           <td style="padding:4px 8px;text-align:right">{rank}</td>
           <td style="padding:4px 8px;font-weight:bold;font-size:15px">{tk}{flag_badge_html(tk)}</td>
           <td style="padding:4px 8px;text-align:right">{score:+.1f}</td>
           <td style="padding:4px 8px">{bias_badge(score)}</td>
+          <td style="padding:4px 8px">{conf_html}</td>
           <td style="padding:4px 8px;text-align:right">{d['mentions']}</td>
           <td style="padding:4px 8px;text-align:right">{len(d['sources'])}</td>
           <td style="padding:4px 8px">{cat}</td>
@@ -787,6 +1041,7 @@ def build_email_body(ranked: list[tuple]) -> tuple[str, str]:
           <th style="padding:6px 8px;text-align:left">Ticker</th>
           <th style="padding:6px 8px;text-align:right">Score</th>
           <th style="padding:6px 8px;text-align:left">Bias</th>
+          <th style="padding:6px 8px;text-align:left">Conf</th>
           <th style="padding:6px 8px;text-align:right">Hits</th>
           <th style="padding:6px 8px;text-align:right">Srcs</th>
           <th style="padding:6px 8px;text-align:left">Catalyst</th>
