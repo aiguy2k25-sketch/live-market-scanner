@@ -311,7 +311,10 @@ def scrape_yahoo_movers() -> list[dict]:
                         "text": f"{tk} {name} pre-market mover {change_text}",
                         "pub": None,
                         "forced_ticker": tk,
-                        "forced_score": 8 if "Gain" in name else (-6 if "Los" in name else 5),
+                        # Gainers/Losers are directional; Most Active is NOT —
+                        # it confirms a name is moving (via mover_sources) but
+                        # must not inject bullish score on its own.
+                        "forced_score": 8 if "Gain" in name else (-6 if "Los" in name else 0),
                         "is_mover": True,
                     })
     return items
@@ -809,14 +812,19 @@ def rank_tickers(ticker_data: dict, top_n=TOP_N) -> list[tuple]:
         has_mover = len(d["mover_sources"]) > 0
 
         raw = d["score"]
+        # Evidence bonuses measure STRENGTH of signal, not direction. They must
+        # amplify the raw score's direction, not always push bullish — otherwise
+        # a stock down -17% on Yahoo Losers (raw ~ -1) gets buried under +10 of
+        # unsigned bonuses and ranks as a top BULL (the ORCL/ADBE bug).
+        sign = 1.0 if raw > 0 else (-1.0 if raw < 0 else 0.0)
         mention_bonus = math.log1p(d["mentions"]) * 2
         source_bonus = len(d["sources"]) * 1.5
         known_bonus = 3.0 if tk in KNOWN_TICKERS else 0.0
-        final = raw + mention_bonus + source_bonus + known_bonus
+        final = raw + sign * (mention_bonus + source_bonus + known_bonus)
 
         if has_news and has_mover:
             d["confirmation"] = "CONFIRMED"
-            final += CONFIRM_BONUS if final >= 0 else -CONFIRM_BONUS
+            final += sign * CONFIRM_BONUS
         elif has_news:
             d["confirmation"] = "NEWS"
         else:
