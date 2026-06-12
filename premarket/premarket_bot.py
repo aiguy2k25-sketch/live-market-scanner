@@ -9,8 +9,14 @@ import asyncio
 import os
 import re
 import smtplib
+import socket
 import sys
 import time
+
+# Safety net: hard cap on ALL network operations (feedparser, smtplib, etc.)
+# Prevents a single hung feed from stalling the whole run until the GitHub
+# Actions job timeout kills it.
+socket.setdefaulttimeout(15)
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
@@ -247,10 +253,20 @@ def fetch(url, timeout=REQUEST_TIMEOUT):
 # --- SCRAPERS ----------------------------------------------------------------
 
 def scrape_rss(feed_url: str, source_name: str) -> list[dict]:
-    """Generic RSS scraper."""
+    """Generic RSS scraper.
+
+    Fetches the feed with requests (hard timeout via fetch()) and then hands
+    the bytes to feedparser. feedparser.parse(url) does its own download with
+    NO timeout, which is what caused runs to hang for 10+ minutes whenever a
+    feed (Seeking Alpha, Investing.com, etc.) stalled. Worst case now is
+    REQUEST_TIMEOUT seconds per dead feed, then we skip it.
+    """
     items = []
     try:
-        feed = feedparser.parse(feed_url)
+        r = fetch(feed_url)
+        if r is None:
+            return items  # feed down/blocked -> already warned in fetch(), skip
+        feed = feedparser.parse(r.content)
         for entry in feed.entries:
             pub = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
             if not is_recent(pub):
