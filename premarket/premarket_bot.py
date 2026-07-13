@@ -20,6 +20,16 @@ socket.setdefaulttimeout(15)
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+
+CT = ZoneInfo("America/Chicago")
+
+
+def now_ct() -> datetime:
+    """Actual Central time. GitHub runners are UTC; naive datetime.now() was
+    being formatted with a hard-coded 'CT' suffix, so every report lied about
+    its own timestamp (ran 12:00 UTC, printed '12:00 PM CT')."""
+    return datetime.now(timezone.utc).astimezone(CT)
 from collections import defaultdict
 import feedparser
 import requests
@@ -152,6 +162,32 @@ EXCLUDE_WORDS = {
     "WHOM","WHY","WILL","WITH","YOUR",
 }
 
+# HARD collisions: these ARE real listed tickers (LNG=Cheniere, AG=First
+# Majestic, EU=enCore Energy, UBS=UBS Group, UK=Ucommune), which is exactly why
+# universe validation waved them through. They are also countries, currencies,
+# commodities, macro indicators and corporate suffixes. A bare-word match is
+# never enough: require Tier-1 syntax ($LNG) or the company name in the text.
+HARD_COLLISIONS = {
+    # countries / regions / geopolitics
+    "EU", "UK", "US", "UN", "AU", "CA", "CN", "DE", "FR", "JP", "IN", "BR", "MX", "RU",
+    # commodities / energy
+    "LNG", "AG", "AU", "OIL", "GAS", "WTI", "CL", "NG", "HG", "PT", "PD",
+    # macro indicators / institutions
+    "PMI", "CPI", "PPI", "GDP", "FED", "ECB", "BOE", "BOJ", "IMF", "OPEC", "NFP", "ISM",
+    # corporate suffixes (Aebi Schmidt Group *AG*, Volkswagen *AG*, ... )
+    "AG", "SA", "NV", "SE", "PLC", "GMBH", "KK", "AB", "AS", "OY",
+    # banks/brokers that author reports about other companies
+    "UBS", "RBC", "BMO", "TD", "MS", "GS", "BCS", "DB", "CS", "JEF", "STT",
+    # exchanges / indices
+    "SPX", "NDX", "DJI", "RUT", "VIX", "FTSE", "DAX", "CAC", "TSX", "ASX",
+}
+
+# Any 2-letter bare token is almost always a word, not a ticker. Require
+# corroboration for all of them.
+def _needs_corroboration(t: str) -> bool:
+    return t in HARD_COLLISIONS or t in AMBIGUOUS_TICKERS or len(t) == 2
+
+
 # Known valid tickers to boost confidence
 KNOWN_TICKERS = {
     "AAPL","MSFT","GOOGL","AMZN","META","TSLA","NVDA","AMD","INTC","QCOM","AVGO","ARM",
@@ -173,12 +209,60 @@ KNOWN_TICKERS = {
 }
 
 
-def score_text(text: str) -> float:
+# M&A is the one catalyst where the SAME headline is bullish for one ticker and
+# bearish for another. "Vertex bets $10B on Crinetics" -> CRNX +100%, VRTX -2%.
+# The old flat "acquisition: +11" scored the ACQUIRER as a top bull.
+_MA_TRIGGERS = ("acquisition", "acquires", "acquire", "merger", "takeover",
+                "buyout", "to buy", "agrees to acquire", "deal to buy")
+
+_ACQUIRER_RE = re.compile(
+    r'\b([A-Z][\w.&-]*(?:\s+[A-Z][\w.&-]*){0,3})\s+'
+    r'(?:to\s+acquire|acquires|acquired|to\s+buy|buys|agrees\s+to\s+acquire|'
+    r'bets\s+\$?[\d.]+\s*[bmk]?(?:illion)?\s+on|makes?\s+\$?[\d.]+\s*[bmk]?\s+deal\s+for)\s+'
+    r'([A-Z][\w.&-]*(?:\s+[A-Z][\w.&-]*){0,3})', re.IGNORECASE)
+
+
+def ma_side(text: str, ticker: str) -> str:
+    """Return 'acquirer', 'target' or '' for this ticker in an M&A headline."""
+    low = text.lower()
+    if not any(t in low for t in _MA_TRIGGERS):
+        return ""
+    name = (TU.company_name_for(ticker) or "").lower()
+    key = name.split()[0] if name else ""
+    m = _ACQUIRER_RE.search(text)
+    if not m:
+        return ""
+    buyer, target = m.group(1).lower(), m.group(2).lower()
+    if len(key) >= 4:
+        if key in buyer:
+            return "acquirer"
+        if key in target:
+            return "target"
+    if ticker.lower() in buyer:
+        return "acquirer"
+    if ticker.lower() in target:
+        return "target"
+    return ""
+
+
+def score_text(text: str, ticker: str | None = None) -> float:
     lower = text.lower()
     score = 0.0
     for kw, w in CATALYST_WEIGHTS.items():
         if kw in lower:
             score += w
+
+    if ticker:
+        side = ma_side(text, ticker)
+        if side == "acquirer":
+            # Strip the M&A bull credit and apply the real historical drift.
+            for kw in ("acquisition", "merger", "takeover", "buyout", "deal",
+                       "agreement", "acquires", "acquired"):
+                if kw in lower:
+                    score -= CATALYST_WEIGHTS[kw]
+            score -= 3.0          # acquirers typically trade DOWN on announcement
+        elif side == "target":
+            score += 15.0         # targets gap to the offer price. This is the trade.
     return score
 
 
@@ -208,8 +292,9 @@ def extract_tickers(text: str) -> list[str]:
             continue
         if not TU.is_valid_ticker(t):
             continue  # not a real listed ticker -> drop (kills YORK, NFL, RCX noise)
-        if t in AMBIGUOUS_TICKERS:
-            # require the company name in the text, e.g. "Webull" for BULL
+        if _needs_corroboration(t):
+            # Real ticker, but also a country / commodity / macro term / suffix /
+            # English word. Only accept if the company's actual name is present.
             name = (TU.company_name_for(t) or "").lower()
             first_word = name.split()[0] if name else ""
             if len(first_word) >= 4 and first_word in lower_text:
@@ -221,18 +306,24 @@ def extract_tickers(text: str) -> list[str]:
 
 
 def is_recent(entry_time, hours=LOOKBACK_HOURS) -> bool:
+    """FAIL CLOSED. Previously returned True when the timestamp was missing or
+    unparseable, so any undated feed item was 'fresh' forever. That is how a
+    July 6 VRTX/Crinetics story and a WDFC gap from the prior session were
+    still being scored as overnight catalysts on July 13."""
     if not entry_time:
-        return True  # assume recent if no timestamp
+        return False
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=hours)
     try:
-        if hasattr(entry_time, 'timetuple'):
+        if hasattr(entry_time, 'timetuple') or isinstance(entry_time, tuple):
             entry_dt = datetime(*entry_time[:6], tzinfo=timezone.utc)
         else:
             entry_dt = entry_time
+        if entry_dt.tzinfo is None:
+            entry_dt = entry_dt.replace(tzinfo=timezone.utc)
         return entry_dt >= cutoff
     except Exception:
-        return True
+        return False
 
 
 def clean_text(s: str) -> str:
@@ -558,7 +649,7 @@ def scrape_stockanalysis_news() -> list[dict]:
 def scrape_market_chameleon_earnings() -> list[dict]:
     """MarketChameleon earnings calendar for today."""
     items = []
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = now_ct().strftime("%Y-%m-%d")
     url = f"https://marketchameleon.com/Overview/Earnings?date={today}"
     r = fetch(url)
     if not r:
@@ -649,11 +740,20 @@ def scrape_sec_edgar() -> list[dict]:
                 continue
             title = getattr(entry, "title", "")
             item = {"source": "SEC 8-K Filings", "title": title, "text": title, "pub": pub}
-            # 8-K titles contain company names, not tickers — resolve via universe
+            # The EDGAR getcurrent index title is literally
+            #   "8-K - TRICO BANCSHARES (0000356171) (Filer)"
+            # There is NO event content in it, so score_text() returns 0 and the
+            # old flat forced_score=6 produced a wall of identical +8.9 rows for
+            # every company that filed anything. Worse, it swallowed the real
+            # FHB/TCBK merger 8-K into that generic bucket.
+            #
+            # An 8-K is now CORROBORATION ONLY: it can confirm a ticker that
+            # already has a real catalyst, but it can never create a row by itself.
             name_hits = TU.tickers_from_company_names(title, max_hits=1)
             if len(name_hits) == 1:
                 item["forced_ticker"] = next(iter(name_hits))
-                item["forced_score"] = 6  # material event filed
+                item["forced_score"] = 0.0
+                item["corroboration_only"] = True
             items.append(item)
     except Exception as e:
         print(f"  [WARN] SEC EDGAR: {e}")
@@ -709,6 +809,8 @@ def aggregate_scores(items: list[dict]) -> dict:
         "catalyst_type": set(),
         "news_sources": set(),   # real reporting (RSS, wires, SEC)
         "mover_sources": set(),  # lists of yesterday's movers (Yahoo/Finviz/StockTwits)
+        "real_evidence": 0,      # items that are NOT corroboration-only 8-K noise
+        "scored_headlines": [],  # (abs_score, headline) -> lets us show the DRIVER
     })
 
     # Dedupe syndicated copies of the same story (same headline via 3 feeds
@@ -727,7 +829,7 @@ def aggregate_scores(items: list[dict]) -> dict:
     for item in items:
         text = clean_text(item.get("text", "") + " " + item.get("title", ""))
         item["title"] = clean_text(item.get("title", ""))
-        base_score = score_text(text)
+        base_score = score_text(text)   # ticker-agnostic baseline
 
         # Determine catalyst types
         cats = set()
@@ -758,16 +860,21 @@ def aggregate_scores(items: list[dict]) -> dict:
             tk = item["forced_ticker"]
             forced_s = item.get("forced_score", base_score)
             d = ticker_data[tk]
-            d["score"] += forced_s + base_score * 0.3
+            ticker_score = score_text(text, tk)          # M&A-aware
+            contrib = forced_s + ticker_score * 0.3
+            d["score"] += contrib
             d["mentions"] += 1
             d["sources"].add(item["source"])
             if item.get("is_mover"):
                 d["mover_sources"].add(item["source"])
             else:
                 d["news_sources"].add(item["source"])
+            if not item.get("corroboration_only"):
+                d["real_evidence"] += 1
             d["catalyst_type"].update(cats)
             if item["title"] not in d["headlines"]:
                 d["headlines"].append(item["title"])
+                d["scored_headlines"].append((abs(contrib), item["title"]))
             continue
 
         # Extract tickers from text
@@ -780,13 +887,16 @@ def aggregate_scores(items: list[dict]) -> dict:
             # Extraction is now universe-validated, so full credit; small extra
             # weight for household names the keyword engine understands well.
             multiplier = 1.0 if tk in KNOWN_TICKERS else 0.8
-            d["score"] += base_score * multiplier
+            contrib = score_text(text, tk) * multiplier   # M&A-aware per ticker
+            d["score"] += contrib
             d["mentions"] += 1
             d["sources"].add(item["source"])
             d["news_sources"].add(item["source"])
+            d["real_evidence"] += 1
             d["catalyst_type"].update(cats)
             if item["title"] not in d["headlines"] and len(d["headlines"]) < 3:
                 d["headlines"].append(item["title"])
+                d["scored_headlines"].append((abs(contrib), item["title"]))
 
     return ticker_data
 
@@ -808,6 +918,15 @@ def rank_tickers(ticker_data: dict, top_n=TOP_N) -> list[tuple]:
     for tk, d in ticker_data.items():
         if d["mentions"] < 1:
             continue
+        # A bare 8-K filing notice is not a catalyst. If ALL evidence for this
+        # ticker was corroboration-only, it never earns a row.
+        if d.get("real_evidence", 0) == 0:
+            continue
+        # Show the headline that actually DROVE the score, not whichever feed
+        # happened to arrive first (that is why every top row said
+        # "PLUG on Yahoo Most Active list").
+        if d.get("scored_headlines"):
+            d["headlines"] = [h for _, h in sorted(d["scored_headlines"], reverse=True)]
         has_news = len(d["news_sources"]) > 0
         has_mover = len(d["mover_sources"]) > 0
 
@@ -856,7 +975,7 @@ def direction_emoji(score):
 
 
 def print_results(ranked: list[tuple]):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = now_ct().strftime("%Y-%m-%d %H:%M:%S")
     print()
     print(f"{Fore.YELLOW}{'='*90}")
     print(f"  PRE-MARKET CATALYST SCANNER  |  {now}")
@@ -924,8 +1043,8 @@ def print_scalp_watchlist(ranked: list[tuple]):
 
 def build_email_body(ranked: list[tuple]) -> tuple[str, str]:
     """Return (plain_text, html) email body."""
-    now_str = datetime.now().strftime("%A %B %d, %Y  %I:%M %p CT")
-    scan_date = datetime.now().strftime("%Y-%m-%d")
+    now_str = now_ct().strftime("%A %B %d, %Y  %I:%M %p CT")
+    scan_date = now_ct().strftime("%Y-%m-%d")
 
     long_side  = [tk for tk, s, d in ranked if s >= 5][:12]
     short_side = [tk for tk, s, d in ranked if s <= -5][:8]
@@ -1096,7 +1215,7 @@ def send_email(ranked: list[tuple]) -> bool:
         print(f"        Set env vars SMTP_USER and SMTP_PASS to enable.")
         return False
 
-    now_str   = datetime.now().strftime("%a %b %d %Y")
+    now_str   = now_ct().strftime("%a %b %d %Y")
     subject   = f"Pre-Market Catalyst Scan  {now_str}  -- Top: " + \
                 ", ".join(tk for tk, s, d in ranked[:5])
 
@@ -1151,10 +1270,10 @@ def main():
     send_email(ranked)
 
     # Save to file
-    out_path = f"scan_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
+    out_path = f"scan_{now_ct().strftime('%Y%m%d_%H%M')}.txt"
     try:
         with open(out_path, "w", encoding="utf-8") as f:
-            f.write(f"PRE-MARKET SCAN  {datetime.now()}\n")
+            f.write(f"PRE-MARKET SCAN  {now_ct()}\n")
             f.write("="*80 + "\n\n")
             for rank, (tk, score, d) in enumerate(ranked, 1):
                 bias = "BULL" if score > 0 else "BEAR"
