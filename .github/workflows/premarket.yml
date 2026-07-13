@@ -2,9 +2,12 @@ name: Pre-Market Catalyst Scanner
 
 on:
   schedule:
-    # 8:00 AM ET = 12:00 UTC during daylight saving (Mar-Nov)
-    # If you want this exact at 8 AM ET year-round, switch to 13:00 UTC in winter
-    - cron: '0 12 * * 1-5'
+    # James is in CT, not ET. '0 12' UTC = 7:00 AM CDT, an hour EARLIER than the
+    # intended 8:00 AM CT -- and the report then printed the raw UTC clock with a
+    # hard-coded "CT" label, so it claimed "12:00 PM CT" while actually running
+    # pre-market. Bot now converts properly; cron below is true 8:00 AM CT (CDT).
+    #   13:00 UTC = 8:00 AM CDT (Mar-Nov)  |  14:00 UTC = 8:00 AM CST (Nov-Mar)
+    - cron: '0 13 * * 1-5'
   workflow_dispatch:   # allow manual trigger from GitHub UI
 
 jobs:
@@ -22,7 +25,7 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
-        run: pip install feedparser requests beautifulsoup4 lxml tabulate colorama
+        run: pip install feedparser requests beautifulsoup4 lxml tabulate colorama tzdata
 
       - name: Run pre-market scanner
         timeout-minutes: 12
