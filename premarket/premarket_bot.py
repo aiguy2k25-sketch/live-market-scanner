@@ -209,6 +209,84 @@ KNOWN_TICKERS = {
 }
 
 
+# --- LAW-FIRM PR SPAM --------------------------------------------------------
+# PR wires (GlobeNewswire, PRNewswire, ACCESSWIRE, Business Wire) are flooded
+# with plaintiff securities-firm advertising. These are solicitations, not
+# catalysts, and they arrive in BULK: one company can generate 15+ near-identical
+# "investor alert" releases from 15 different firms in a single night.
+#
+# Two distinct ways they corrupt the scan:
+#
+#   1. VOLUME. Every one of these carries explicit "(NASDAQ: XYZ)" syntax, which
+#      is Tier-1 in extract_tickers() -- accepted unconditionally, full confidence.
+#      The dedupe pass above keys on the headline, and each firm writes its own,
+#      so 15 releases survive as 15 separate "mentions" across multiple "sources".
+#      The ticker climbs the rank on pure ad volume.
+#
+#   2. POLARITY. Merger-objection firms (Monteverde, Halper Sadeh, WeissLaw,
+#      Rigrodsky) publish "investigating the merger of..." releases. Those strings
+#      hit _MA_TRIGGERS below, and if _ACQUIRER_RE reads the company as the target,
+#      the item collects the +15.0 M&A bonus. A lawsuit advertisement becomes a
+#      top-ranked bullish buyout signal. This is the compounding failure.
+#
+# Filter runs at ingest, before scoring, so neither path can fire.
+
+LAW_FIRMS = (
+    # NOTE: match on distinctive template phrasing, not just firm names. Rosen's
+    # wire template leads with "ROSEN, A LEADING LAW FIRM, Encourages..." -- the
+    # string "rosen law" never appears in it.
+    "rosen law", "a leading law firm", "leading investor rights law firm",
+    "pomerantz", "levi & korsinsky", "levi and korsinsky",
+    "glancy prongay", "bronstein, gewirtz", "bronstein gewirtz",
+    "robbins geller", "robbins llp", "kessler topaz", "bragar eagel",
+    "kahn swick", "schall law", "faruqi & faruqi", "faruqi and faruqi",
+    "johnson fistel", "hagens berman", "gross law firm", "howard g. smith",
+    "berger montague", "block & leviton", "block and leviton", "kirby mcinerney",
+    "monteverde & associates", "monteverde and associates", "halper sadeh",
+    "rigrodsky", "weisslaw", "ademi llp", "kaskela", "purcell & lefkowitz",
+    "grabar law", "federman & sherwood", "wolf haldenstein", "saxena white",
+    "labaton", "bernstein liebhard", "gainey mckenna", "scott+scott",
+    "holzer & holzer", "andrews & springer", "brodsky & smith", "kuehn law",
+    "thornton law", "cohen milstein", "abraham fruchter", "shareholder rights law",
+    "law offices of",
+)
+
+LAW_FIRM_BOILERPLATE = (
+    "investor alert", "shareholder alert", "class action lawsuit",
+    "securities class action", "securities fraud class action",
+    "lead plaintiff deadline", "lead plaintiff", "deadline reminder",
+    "encourages investors", "encourages shareholders", "reminds investors",
+    "reminds shareholders", "notifies investors", "investigating potential claims",
+    "investigation on behalf of", "on behalf of shareholders",
+    "on behalf of investors", "if you purchased", "if you suffered a loss",
+    "recover your losses", "attorney advertising", "no cost to you",
+    "contact the firm", "contingency fee", "prior results",
+    "breach of fiduciary duty", "securities litigation", "notice of pendency",
+    "class period", "may have been misled", "secure counsel",
+    "before important deadline", "notifies shareholders", "announces the filing",
+)
+
+
+def is_law_firm_spam(text: str) -> bool:
+    """True if the item is plaintiff-firm advertising rather than reporting.
+
+    Trips on EITHER condition:
+      * a known securities-litigation firm is named, OR
+      * two or more solicitation boilerplate phrases appear.
+
+    The 2-phrase floor is deliberate -- it keeps real reporting alive. A single
+    mention of "class action" is not enough to kill an item, because
+    "Judge certifies class action against XYZ" is genuine news and should still
+    score its -9. But "Rosen Law Firm reminds investors of the lead plaintiff
+    deadline in the XYZ securities class action" trips the firm name AND three
+    boilerplate phrases.
+    """
+    low = text.lower()
+    if any(f in low for f in LAW_FIRMS):
+        return True
+    return sum(1 for p in LAW_FIRM_BOILERPLATE if p in low) >= 2
+
+
 # M&A is the one catalyst where the SAME headline is bullish for one ticker and
 # bearish for another. "Vertex bets $10B on Crinetics" -> CRNX +100%, VRTX -2%.
 # The old flat "acquisition: +11" scored the ACQUIRER as a top bull.
@@ -825,6 +903,25 @@ def aggregate_scores(items: list[dict]) -> dict:
             seen_keys.add(key)
         deduped.append(item)
     items = deduped
+
+    # Drop plaintiff-firm advertising BEFORE it reaches the scorer. Must run
+    # after dedupe (each firm writes its own headline, so dedupe cannot catch
+    # them) and before scoring (or the M&A target bonus fires on merger-
+    # objection ads). is_mover items are structured rows, never PR text -- skip.
+    kept, spam_n = [], 0
+    for item in items:
+        if item.get("is_mover"):
+            kept.append(item)
+            continue
+        blob = f"{item.get('title', '')} {item.get('text', '')}"
+        if is_law_firm_spam(blob):
+            spam_n += 1
+            continue
+        kept.append(item)
+    if spam_n:
+        print(f"  {Fore.YELLOW}[SPAM] Dropped {spam_n} law-firm / investor-alert "
+              f"PR items ({len(kept)} kept){Style.RESET_ALL}")
+    items = kept
 
     for item in items:
         text = clean_text(item.get("text", "") + " " + item.get("title", ""))
