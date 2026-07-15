@@ -141,6 +141,9 @@ AMBIGUOUS_TICKERS = {
     "STEP", "TASK", "TEAM", "TECH", "TELL", "TILE", "TREE", "TRIP", "TRUE",
     "TURN", "TWO", "VG", "WAY", "WELL", "WIRE", "WOW", "YETI", "YOU", "NP",
     "SM", "CC", "GO", "IT", "ME", "MO", "ON", "OUT", "RUN", "SAVE", "TV",
+    # English words that are also real tickers, caught 2026-07-15 when an
+    # ALL-CAPS Kiehl's x Milk Bar cosmetics PR put BAR and CARE in LONG BIAS
+    "BAR", "CARE", "MILK", "SKIN", "GLOW", "PURE", "SOAP",
     # "UPS" in PR text is almost always Uninterruptible Power Supply, not
     # United Parcel Service (2026-07-14: a CBAK Energy battery-testing release
     # was attributed to UPS). Require "(NYSE: UPS)" / $UPS / "United Parcel".
@@ -451,6 +454,17 @@ def extract_tickers(text: str) -> list[str]:
     for m in STRONG_TICKER_RE.finditer(text):
         tk = next(g for g in m.groups() if g)
         found.add(tk.split(".")[0])
+
+    # ALL-CAPS text ("INDULGE IN DELECTABLE SKINCARE WITH KIEHL'S X MILK
+    # BAR...") makes every word a ticker candidate. If most words are
+    # uppercase, capitalization carries no signal: skip bare-word tiers
+    # entirely and rely on explicit $X / (NYSE: X) syntax, which shouty PR
+    # wires still use when they mean a ticker.
+    words = re.findall(r"[A-Za-z][A-Za-z']+", text)
+    if words:
+        caps = sum(1 for w in words if w.isupper() and len(w) >= 2)
+        if caps / len(words) > 0.6:
+            return list(found)
 
     # Tier 2 / 3 — bare words, validated against the listed universe
     lower_text = text.lower()
