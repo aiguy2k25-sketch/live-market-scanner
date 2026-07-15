@@ -2,10 +2,13 @@ name: Daily Scanner
 
 on:
   schedule:
-    # 13:00 UTC = 8:00 AM CT (pre-market, during CDT)
-    - cron: '0 13 * * 1-5'
-    # 20:30 UTC = 3:30 PM CT (post-close, during CDT)
-    - cron: '30 20 * * 1-5'
+    # GitHub Actions delays scheduled runs 30-80 min, worst at :00/:30 slots
+    # (2026-07-14: the 13:00 UTC premarket run started ~78 min late). Both
+    # crons below are scheduled early at off-peak minutes to absorb the delay.
+    # 12:12 UTC = 7:12 AM CDT nominal -> email lands before the 8:30 open
+    - cron: '12 12 * * 1-5'
+    # 20:18 UTC = 3:18 PM CDT nominal -> post-close email arrives ~3:45-4:30
+    - cron: '18 20 * * 1-5'
   workflow_dispatch:  # allow manual runs from the Actions tab
 
 jobs:
