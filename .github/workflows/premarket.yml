@@ -5,9 +5,22 @@ on:
     # James is in CT, not ET. '0 12' UTC = 7:00 AM CDT, an hour EARLIER than the
     # intended 8:00 AM CT -- and the report then printed the raw UTC clock with a
     # hard-coded "CT" label, so it claimed "12:00 PM CT" while actually running
-    # pre-market. Bot now converts properly; cron below is true 8:00 AM CT (CDT).
-    #   13:00 UTC = 8:00 AM CDT (Mar-Nov)  |  14:00 UTC = 8:00 AM CST (Nov-Mar)
-    - cron: '0 13 * * 1-5'
+    # pre-market. Bot now converts properly.
+    #
+    # 2026-07-14: the 13:00 UTC (8:00 CDT) run actually STARTED at ~14:18 UTC
+    # and the "pre-market" email arrived at 9:18 AM CT -- 48 min after the open.
+    # GitHub Actions scheduled workflows queue behind everyone else's, and
+    # on-the-hour slots (:00) are the most congested; 30-80 min delays are
+    # normal. Two mitigations:
+    #   1. Off-peak minute (:12) -- far less queue contention than :00.
+    #   2. Scheduled a ~50-min buffer early (12:12 UTC = 7:12 AM CDT), so even
+    #      a 60-min delay still lands the email before the 8:30 CT open.
+    - cron: '12 12 * * 1-5'
+    # Post-open re-scans targeting ~8:45 and ~9:15 AM CT. GitHub's 20-40 min
+    # typical delay is baked in: nominal 8:22 CDT lands ~8:45-9:00, nominal
+    # 8:52 CDT lands ~9:15-9:30. Off-peak minutes to minimize queue time.
+    - cron: '22 13 * * 1-5'
+    - cron: '52 13 * * 1-5'
   workflow_dispatch:   # allow manual trigger from GitHub UI
 
 jobs:
