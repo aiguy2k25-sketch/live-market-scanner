@@ -203,6 +203,12 @@ HARD_COLLISIONS = {
     # Neuberger Berman High Yield fund) both ranked as catalyst stocks.
     "WTO", "NHS", "WHO", "EPA", "DOJ", "FTC", "FCC", "DOE", "DOT", "FBI",
     "NSA", "UAW", "OSHA", "CDC", "NIH", "HHS", "FAA", "TSA", "CMS", "PPE",
+    # name-collision tickers: EQT the US natgas producer vs EQT AB, the
+    # Swedish PE giant that appears in M&A headlines constantly (2026-07-15:
+    # "Perpetual Gets Improved Offer From EQT" scored EQT Corp). SBI = State
+    # Bank of India (2026-07-15: "India's SBI Funds IPO" ranked as a US row).
+    # Real EQT Corp / SBI news still enters via $EQT, (NYSE: EQT), or movers.
+    "EQT", "SBI",
     # corporate suffixes (Aebi Schmidt Group *AG*, Volkswagen *AG*, UAB = the
     # Lithuanian LLC prefix that put AEI on the 2026-07-14 scan)
     "AG", "SA", "NV", "SE", "PLC", "GMBH", "KK", "AB", "AS", "OY", "UAB",
@@ -328,6 +334,7 @@ _ACQUIRER_RE = re.compile(
     r'(?:to\s+acquire|acquires|acquired|to\s+buy|buys|agrees\s+to\s+acquire|'
     r'pursu(?:es|ing)|bids?\s+for|offers?\s+to\s+(?:buy|acquire)|'
     r'in\s+talks\s+to\s+(?:buy|acquire)|weighs\s+(?:a\s+)?(?:bid|offer)\s+for|'
+    r'(?:finali[sz]es|completes|closes)\s+(?:the\s+)?acquisition\s+of|'
     r'explores\s+(?:an\s+)?acquisition\s+of|launches\s+(?:a\s+)?(?:tender\s+)?offer\s+for|'
     r'proposes\s+to\s+acquire|'
     r'bets\s+\$?[\d.]+\s*[bmk]?(?:illion)?\s+on|makes?\s+\$?[\d.]+\s*[bmk]?\s+deal\s+for)\s+'
@@ -336,13 +343,17 @@ _ACQUIRER_RE = re.compile(
 # Fallback patterns that identify only the TARGET. Handles consortium / bid
 # phrasing where no "X acquires Y" pair exists: "KKR joins consortium pursuing
 # Steadfast acquisition proposal" (2026-07-14: scored KKR as a top BULL).
+# 2026-07-15: "SiTime Finalizes Acquisition of Renesas Timing Business" scored
+# SITM +11.7 BULL -- these regexes lacked IGNORECASE, so "Acquisition of"
+# (capital A) never matched. Triggers are now scoped (?i:...) so the company-
+# name capture stays case-sensitive.
 _TARGET_AFTER_RE = re.compile(
-    r'(?:pursuing|acquisition\s+of|takeover\s+of|buyout\s+of|bid\s+for|'
+    r'(?i:pursuing|acquisition\s+of|takeover\s+of|buyout\s+of|bid\s+for|'
     r'offer\s+for|to\s+acquire|to\s+buy)\s+'
     r'([A-Z][\w.&-]*(?:\s+[A-Z][\w.&-]*){0,3})')
 _TARGET_BEFORE_RE = re.compile(
     r'([A-Z][\w.&-]*(?:\s+[A-Z][\w.&-]*){0,3})\s+'
-    r'(?:acquisition|takeover|buyout|merger)\s+(?:proposal|bid|offer|deal|talks)')
+    r'(?i:acquisition|takeover|buyout|merger)\s+(?i:proposal|bid|offer|deal|talks)')
 
 
 def ma_side(text: str, ticker: str) -> str:
@@ -1103,6 +1114,12 @@ def aggregate_scores(items: list[dict]) -> dict:
             if tk in SELL_SIDE_BANKS and ANALYST_ACTION_RE.search(text):
                 continue
             d = ticker_data[tk]
+            # OTC / pink-sheet detection needs no API: the PR itself says so.
+            # 2026-07-15: Premier Graphene "(OTC: BIEI)" ranked #6 LONG BIAS
+            # with no NO-TRADE badge because the network price check failed
+            # silently. OTC names are outside the rules universe, full stop.
+            if re.search(rf'\(OTC[A-Z\s]*:\s*{re.escape(tk)}\b', text, re.IGNORECASE):
+                d["is_otc"] = True
             # Extraction is now universe-validated, so full credit; small extra
             # weight for household names the keyword engine understands well.
             multiplier = 1.0 if tk in KNOWN_TICKERS else 0.8
@@ -1131,6 +1148,9 @@ def apply_rules_flags(ranked: list[tuple]) -> None:
     SKIP = {"SPY", "QQQ", "IWM", "DIA", "GLD", "SLV", "TLT", "VIX"}  # not stocks
     deadline = time.time() + 45
     for tk, _score, d in ranked:
+        # Local, zero-network flag first: OTC syntax seen in the PR itself.
+        if d.get("is_otc"):
+            d["rule_flags"] = "OTC"
         if tk in SKIP or time.time() > deadline:
             continue
         try:
@@ -1205,9 +1225,18 @@ def rank_tickers(ticker_data: dict, top_n=TOP_N) -> list[tuple]:
 
         ranked.append((tk, final, d))
 
-    # Sort: confirmed first, then by absolute score (big moves either way are tradeable)
+    # Sort: confirmed first, then by absolute score (big moves either way are
+    # tradeable). 2026-07-15: NVDA and BAC at 0.0 Neutral held rows #4-5 above
+    # +16 NEWS signals purely because they were CONFIRMED. A neutral row is
+    # not actionable regardless of confirmation -- demote it half a tier so
+    # scored NEWS outranks neutral CONFIRMED.
     conf_order = {"CONFIRMED": 0, "NEWS": 1, "MOVER-ONLY": 2}
-    ranked.sort(key=lambda x: (conf_order[x[2]["confirmation"]], -abs(x[1])))
+    def _sort_key(x):
+        tier = conf_order[x[2]["confirmation"]]
+        if abs(x[1]) < 4:          # neutral band, same threshold as the badge
+            tier += 1.5
+        return (tier, -abs(x[1]))
+    ranked.sort(key=_sort_key)
     return ranked[:top_n]
 
 
@@ -1298,8 +1327,12 @@ def build_email_body(ranked: list[tuple]) -> tuple[str, str]:
     now_str = now_ct().strftime("%A %B %d, %Y  %I:%M %p CT")
     scan_date = now_ct().strftime("%Y-%m-%d")
 
-    long_side  = [tk for tk, s, d in ranked if s >= 5][:12]
-    short_side = [tk for tk, s, d in ranked if s <= -5][:8]
+    # Rule violators (OTC / <$5 / <$500M) never belong in the actionable bias
+    # lists -- 2026-07-15: OTC pink-sheet BIEI led the LONG BIAS header.
+    long_side  = [tk for tk, s, d in ranked
+                  if s >= 5 and not d.get("rule_flags")][:12]
+    short_side = [tk for tk, s, d in ranked
+                  if s <= -5 and not d.get("rule_flags")][:8]
 
     # Portfolio discipline section (safe if module or CSV is missing)
     portfolio_plain, portfolio_html, portfolio_flags = "", "", {}
