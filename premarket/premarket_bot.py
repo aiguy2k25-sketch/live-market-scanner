@@ -592,6 +592,11 @@ def scrape_yahoo_movers() -> list[dict]:
                 tk = ticker_match.group(1)
                 if tk not in EXCLUDE_WORDS:
                     change_text = cells[4].get_text(strip=True) if len(cells) > 4 else ""
+                    # Parse |change| as a tiebreaker. 2026-07-15: all 20
+                    # mover-only rows tied at the +6.0 cap, so SKHY (+41.57)
+                    # sorted BELOW ATAI (+0.70). Magnitude restores ordering.
+                    _m = re.search(r'([-+]?\d+(?:\.\d+)?)', change_text)
+                    magnitude = abs(float(_m.group(1))) if _m else 0.0
                     items.append({
                         "source": name,
                         "title": f"{tk} on {name} list ({change_text})",
@@ -602,6 +607,7 @@ def scrape_yahoo_movers() -> list[dict]:
                         # it confirms a name is moving (via mover_sources) but
                         # must not inject bullish score on its own.
                         "forced_score": 8 if "Gain" in name else (-6 if "Los" in name else 0),
+                        "mover_magnitude": magnitude,
                         "is_mover": True,
                     })
     return items
@@ -1085,6 +1091,9 @@ def aggregate_scores(items: list[dict]) -> dict:
             tk = item["forced_ticker"]
             forced_s = item.get("forced_score", base_score)
             d = ticker_data[tk]
+            if item.get("mover_magnitude"):
+                d["mover_mag"] = max(d.get("mover_mag", 0.0),
+                                     item["mover_magnitude"])
             ticker_score = score_text(text, tk)          # M&A-aware
             contrib = forced_s + ticker_score * 0.3
             d["score"] += contrib
@@ -1235,7 +1244,11 @@ def rank_tickers(ticker_data: dict, top_n=TOP_N) -> list[tuple]:
         tier = conf_order[x[2]["confirmation"]]
         if abs(x[1]) < 4:          # neutral band, same threshold as the badge
             tier += 1.5
-        return (tier, -abs(x[1]))
+        if x[2].get("is_otc"):     # pink sheets never outrank listed catalysts
+            tier += 1.5
+        # Tiebreak capped mover-only rows by actual move size, so SKHY
+        # (+41.57) ranks above ATAI (+0.70) instead of arbitrary order.
+        return (tier, -abs(x[1]), -x[2].get("mover_mag", 0.0))
     ranked.sort(key=_sort_key)
     return ranked[:top_n]
 
@@ -1329,10 +1342,14 @@ def build_email_body(ranked: list[tuple]) -> tuple[str, str]:
 
     # Rule violators (OTC / <$5 / <$500M) never belong in the actionable bias
     # lists -- 2026-07-15: OTC pink-sheet BIEI led the LONG BIAS header.
+    # MOVER-ONLY rows are lagging information (yesterday's gainers), not a
+    # trade bias -- 2026-07-15: twenty +6.0 mover ties flooded LONG BIAS.
     long_side  = [tk for tk, s, d in ranked
-                  if s >= 5 and not d.get("rule_flags")][:12]
+                  if s >= 5 and not d.get("rule_flags")
+                  and d.get("confirmation") != "MOVER-ONLY"][:12]
     short_side = [tk for tk, s, d in ranked
-                  if s <= -5 and not d.get("rule_flags")][:8]
+                  if s <= -5 and not d.get("rule_flags")
+                  and d.get("confirmation") != "MOVER-ONLY"][:8]
 
     # Portfolio discipline section (safe if module or CSV is missing)
     portfolio_plain, portfolio_html, portfolio_flags = "", "", {}
