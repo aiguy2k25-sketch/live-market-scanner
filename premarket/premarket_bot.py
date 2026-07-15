@@ -107,6 +107,10 @@ CATALYST_WEIGHTS = {
     # General negative
     "plunged": -5, "tumbled": -5, "dropped": -4, "fell": -3, "declined": -3,
     "losses": -3, "warning": -5, "disappointing": -5,
+    # 2026-07-14: ASML scored 0.0 Neutral on "Trillion Dollar Chip Rout"
+    "rout": -6, "crash": -6, "craters": -6, "cratered": -6, "slump": -4,
+    "selloff": -5, "sell-off": -5, "pummeled": -6, "sinks": -4, "sank": -4,
+    "collapse": -7, "tanks": -4, "tanked": -4,
 }
 
 # --- HELPERS -----------------------------------------------------------------
@@ -137,7 +141,26 @@ AMBIGUOUS_TICKERS = {
     "STEP", "TASK", "TEAM", "TECH", "TELL", "TILE", "TREE", "TRIP", "TRUE",
     "TURN", "TWO", "VG", "WAY", "WELL", "WIRE", "WOW", "YETI", "YOU", "NP",
     "SM", "CC", "GO", "IT", "ME", "MO", "ON", "OUT", "RUN", "SAVE", "TV",
+    # "UPS" in PR text is almost always Uninterruptible Power Supply, not
+    # United Parcel Service (2026-07-14: a CBAK Energy battery-testing release
+    # was attributed to UPS). Require "(NYSE: UPS)" / $UPS / "United Parcel".
+    "UPS",
 }
+
+# Sell-side firms that AUTHOR analyst actions about OTHER companies. When one
+# of these appears in an upgrade/downgrade/forecast headline, the bank is the
+# analyst, not the subject -- 2026-07-14: "HSBC loses conviction in leading
+# drugmaker" scored HSBC bearish. The downgraded drugmaker owns that score.
+SELL_SIDE_BANKS = {
+    "GS", "MS", "JPM", "BAC", "C", "WFC", "UBS", "HSBC", "DB", "BCS",
+    "RBC", "BMO", "TD", "JEF", "CS", "LAZ", "PJT", "EVR", "RJF", "SF", "MUFG",
+}
+ANALYST_ACTION_RE = re.compile(
+    r'\b(upgrad\w+|downgrad\w+|initiat\w+\s+coverage|price\s+target|'
+    r'overweight|underweight|outperform|underperform|buy\s+rating|'
+    r'sell\s+rating|neutral\s+rating|maintains|reiterates|top\s+pick|'
+    r'loses\s+conviction|forecasts?|sees\s+\$|names?\s+.{0,30}\s+pick)\b',
+    re.IGNORECASE)
 
 # Common words to exclude from ticker detection
 EXCLUDE_WORDS = {
@@ -174,8 +197,15 @@ HARD_COLLISIONS = {
     "LNG", "AG", "AU", "OIL", "GAS", "WTI", "CL", "NG", "HG", "PT", "PD",
     # macro indicators / institutions
     "PMI", "CPI", "PPI", "GDP", "FED", "ECB", "BOE", "BOJ", "IMF", "OPEC", "NFP", "ISM",
-    # corporate suffixes (Aebi Schmidt Group *AG*, Volkswagen *AG*, ... )
-    "AG", "SA", "NV", "SE", "PLC", "GMBH", "KK", "AB", "AS", "OY",
+    # org / government acronyms that ARE also real listed tickers.
+    # 2026-07-14 scan: "WTO" (World Trade Organization in a fertiliser-trade
+    # story) and "NHS" (UK National Health Service in a PPE story; NHS is the
+    # Neuberger Berman High Yield fund) both ranked as catalyst stocks.
+    "WTO", "NHS", "WHO", "EPA", "DOJ", "FTC", "FCC", "DOE", "DOT", "FBI",
+    "NSA", "UAW", "OSHA", "CDC", "NIH", "HHS", "FAA", "TSA", "CMS", "PPE",
+    # corporate suffixes (Aebi Schmidt Group *AG*, Volkswagen *AG*, UAB = the
+    # Lithuanian LLC prefix that put AEI on the 2026-07-14 scan)
+    "AG", "SA", "NV", "SE", "PLC", "GMBH", "KK", "AB", "AS", "OY", "UAB",
     # banks/brokers that author reports about other companies
     "UBS", "RBC", "BMO", "TD", "MS", "GS", "BCS", "DB", "CS", "JEF", "STT",
     # exchanges / indices
@@ -296,8 +326,23 @@ _MA_TRIGGERS = ("acquisition", "acquires", "acquire", "merger", "takeover",
 _ACQUIRER_RE = re.compile(
     r'\b([A-Z][\w.&-]*(?:\s+[A-Z][\w.&-]*){0,3})\s+'
     r'(?:to\s+acquire|acquires|acquired|to\s+buy|buys|agrees\s+to\s+acquire|'
+    r'pursu(?:es|ing)|bids?\s+for|offers?\s+to\s+(?:buy|acquire)|'
+    r'in\s+talks\s+to\s+(?:buy|acquire)|weighs\s+(?:a\s+)?(?:bid|offer)\s+for|'
+    r'explores\s+(?:an\s+)?acquisition\s+of|launches\s+(?:a\s+)?(?:tender\s+)?offer\s+for|'
+    r'proposes\s+to\s+acquire|'
     r'bets\s+\$?[\d.]+\s*[bmk]?(?:illion)?\s+on|makes?\s+\$?[\d.]+\s*[bmk]?\s+deal\s+for)\s+'
     r'([A-Z][\w.&-]*(?:\s+[A-Z][\w.&-]*){0,3})', re.IGNORECASE)
+
+# Fallback patterns that identify only the TARGET. Handles consortium / bid
+# phrasing where no "X acquires Y" pair exists: "KKR joins consortium pursuing
+# Steadfast acquisition proposal" (2026-07-14: scored KKR as a top BULL).
+_TARGET_AFTER_RE = re.compile(
+    r'(?:pursuing|acquisition\s+of|takeover\s+of|buyout\s+of|bid\s+for|'
+    r'offer\s+for|to\s+acquire|to\s+buy)\s+'
+    r'([A-Z][\w.&-]*(?:\s+[A-Z][\w.&-]*){0,3})')
+_TARGET_BEFORE_RE = re.compile(
+    r'([A-Z][\w.&-]*(?:\s+[A-Z][\w.&-]*){0,3})\s+'
+    r'(?:acquisition|takeover|buyout|merger)\s+(?:proposal|bid|offer|deal|talks)')
 
 
 def ma_side(text: str, ticker: str) -> str:
@@ -306,20 +351,32 @@ def ma_side(text: str, ticker: str) -> str:
     if not any(t in low for t in _MA_TRIGGERS):
         return ""
     name = (TU.company_name_for(ticker) or "").lower()
-    key = name.split()[0] if name else ""
+    key = _name_evidence(name)   # generic-safe ("united parcel", not "united")
     m = _ACQUIRER_RE.search(text)
-    if not m:
-        return ""
-    buyer, target = m.group(1).lower(), m.group(2).lower()
-    if len(key) >= 4:
-        if key in buyer:
+    if m:
+        buyer, target = m.group(1).lower(), m.group(2).lower()
+        if len(key) >= 4:
+            if key in buyer:
+                return "acquirer"
+            if key in target:
+                return "target"
+        if ticker.lower() in buyer:
             return "acquirer"
-        if key in target:
+        if ticker.lower() in target:
             return "target"
-    if ticker.lower() in buyer:
-        return "acquirer"
-    if ticker.lower() in target:
+        return ""
+
+    # Fallback: find the TARGET by pattern. In an M&A headline, any OTHER
+    # company mentioned is on the buy side (consortium member, bidder).
+    m2 = _TARGET_BEFORE_RE.search(text) or _TARGET_AFTER_RE.search(text)
+    if not m2:
+        return ""
+    tgt = m2.group(1).lower()
+    if (len(key) >= 4 and key in tgt) or ticker.lower() in tgt:
         return "target"
+    if (len(key) >= 4 and key in low) or \
+            re.search(rf'\b{re.escape(ticker)}\b', text):
+        return "acquirer"
     return ""
 
 
@@ -342,6 +399,28 @@ def score_text(text: str, ticker: str | None = None) -> float:
         elif side == "target":
             score += 15.0         # targets gap to the offer price. This is the trade.
     return score
+
+
+# Company names that START with a generic word would corroborate falsely:
+# "United Parcel Service" -> first word "united" matches "United States" in
+# any macro headline and re-admits UPS; "First Bancorp" -> "first" matches
+# almost anything. For these, require the first TWO words of the name.
+GENERIC_NAME_WORDS = {
+    "united", "first", "american", "national", "general", "global", "world",
+    "international", "pacific", "southern", "northern", "western", "eastern",
+    "digital", "capital", "consumer", "energy", "health", "home", "royal",
+}
+
+
+def _name_evidence(name: str) -> str:
+    """Return the shortest company-name substring that is strong evidence the
+    company is actually the subject of the text."""
+    words = name.split()
+    if not words:
+        return ""
+    if words[0] in GENERIC_NAME_WORDS and len(words) >= 2:
+        return f"{words[0]} {words[1]}"          # "united parcel"
+    return words[0] if len(words[0]) >= 4 else ""
 
 
 def extract_tickers(text: str) -> list[str]:
@@ -374,8 +453,8 @@ def extract_tickers(text: str) -> list[str]:
             # Real ticker, but also a country / commodity / macro term / suffix /
             # English word. Only accept if the company's actual name is present.
             name = (TU.company_name_for(t) or "").lower()
-            first_word = name.split()[0] if name else ""
-            if len(first_word) >= 4 and first_word in lower_text:
+            ev = _name_evidence(name)
+            if ev and ev in lower_text:
                 found.add(t)
             continue
         found.add(t)
@@ -402,6 +481,34 @@ def is_recent(entry_time, hours=LOOKBACK_HOURS) -> bool:
         return entry_dt >= cutoff
     except Exception:
         return False
+
+
+_EN_STOPWORDS = {
+    "the", "of", "to", "in", "for", "and", "on", "with", "as", "at", "by",
+    "from", "after", "amid", "its", "is", "are", "up", "down", "over", "new",
+    "will", "has", "have", "an", "a", "into", "than", "more", "says", "said",
+}
+
+
+def is_probably_english(s: str) -> bool:
+    """Cheap language gate for PR-wire noise. Two signals:
+      1) letters >10% non-ASCII (Cyrillic, heavy-diacritic text), or
+      2) accented letters present AND zero common English function words
+         (catches Lithuanian/Baltic PR, which uses few diacritics -- the
+         2026-07-14 'UAB Atsinaujinancios energetikos...' item passed a pure
+         ratio test at ~3% non-ASCII).
+    Pure-ASCII text always passes."""
+    letters = [c for c in s if c.isalpha()]
+    if not letters:
+        return True
+    non_ascii = sum(1 for c in letters if ord(c) > 127)
+    if (non_ascii / len(letters)) >= 0.10:
+        return False
+    if non_ascii >= 2:
+        words = re.findall(r"[a-z']+", s.lower())
+        if len(words) >= 5 and not (_EN_STOPWORDS & set(words)):
+            return False
+    return True
 
 
 def clean_text(s: str) -> str:
@@ -917,6 +1024,12 @@ def aggregate_scores(items: list[dict]) -> dict:
         if is_law_firm_spam(blob):
             spam_n += 1
             continue
+        # 2026-07-14: a Lithuanian-language UAB press release ("Atsinaujinancios
+        # energetikos investicijos...") scored AEI. Non-English PR is noise for
+        # a US pre-market scan -- drop it before extraction.
+        if not is_probably_english(blob):
+            spam_n += 1
+            continue
         kept.append(item)
     if spam_n:
         print(f"  {Fore.YELLOW}[SPAM] Dropped {spam_n} law-firm / investor-alert "
@@ -935,7 +1048,11 @@ def aggregate_scores(items: list[dict]) -> dict:
             cats.add("Earnings")
         if any(k in lower for k in ["fda", "approval", "clinical", "phase"]):
             cats.add("FDA/Biotech")
-        if any(k in lower for k in ["acquisition", "merger", "buyout", "takeover"]):
+        # 2026-07-14: "First Bancorp To Acquire First Carolina" and "Diodes To
+        # Buy ElevATE" were labeled "General" -- only noun forms were checked.
+        if any(k in lower for k in ["acquisition", "merger", "buyout", "takeover",
+                                    "acquire", "acquires", "acquired", "to buy",
+                                    "buys "]):
             cats.add("M&A")
         if any(k in lower for k in ["upgrade", "downgrade", "price target", "initiated"]):
             cats.add("Analyst")
@@ -980,6 +1097,11 @@ def aggregate_scores(items: list[dict]) -> dict:
             continue
 
         for tk in tickers:
+            # The bank is the AUTHOR of the analyst action, not the subject
+            # ("HSBC loses conviction in leading drugmaker" is not HSBC news).
+            # Real GS/MS/etc. moves still get in via the Yahoo movers path.
+            if tk in SELL_SIDE_BANKS and ANALYST_ACTION_RE.search(text):
+                continue
             d = ticker_data[tk]
             # Extraction is now universe-validated, so full credit; small extra
             # weight for household names the keyword engine understands well.
@@ -996,6 +1118,39 @@ def aggregate_scores(items: list[dict]) -> dict:
                 d["scored_headlines"].append((abs(contrib), item["title"]))
 
     return ticker_data
+
+
+def apply_rules_flags(ranked: list[tuple]) -> None:
+    """Tag tickers that violate the trading-rules universe (price > $5,
+    market cap > $500M) so they are visibly NO-TRADE rows. 2026-07-14: PSHG
+    (sub-$5 shipping micro-cap) ranked #6 with no warning.
+
+    Uses stockanalysis.com's quote API (no key). FAILS OPEN: if the lookup
+    breaks, no flags are added and the scan is unaffected. Hard 45-second
+    total budget so 30 slow lookups can never stall the email."""
+    SKIP = {"SPY", "QQQ", "IWM", "DIA", "GLD", "SLV", "TLT", "VIX"}  # not stocks
+    deadline = time.time() + 45
+    for tk, _score, d in ranked:
+        if tk in SKIP or time.time() > deadline:
+            continue
+        try:
+            r = requests.get(
+                f"https://stockanalysis.com/api/symbol/s/{tk.lower()}/quote",
+                headers=HEADERS, timeout=5)
+            if r.status_code != 200:
+                continue
+            q = r.json().get("data", {}) or {}
+            price = q.get("p") or q.get("price")
+            mcap = q.get("mc") or q.get("marketCap")
+            flags = []
+            if isinstance(price, (int, float)) and price < 5:
+                flags.append(f"<$5 (${price:.2f})")
+            if isinstance(mcap, (int, float)) and 0 < mcap < 500_000_000:
+                flags.append("<$500M cap")
+            if flags:
+                d["rule_flags"] = " / ".join(flags)
+        except Exception:
+            continue  # fail open -- never let a quote lookup kill the scan
 
 
 def rank_tickers(ticker_data: dict, top_n=TOP_N) -> list[tuple]:
@@ -1173,7 +1328,8 @@ def build_email_body(ranked: list[tuple]) -> tuple[str, str]:
         conf = d.get("confirmation", "")[:9]
         cat  = ", ".join(sorted(d["catalyst_type"]))[:20]
         hl   = (d["headlines"][0][:50] + "...") if d["headlines"] else ""
-        lines.append(f"#{rank:<3} {tk:<7} {score:>+7.1f}  {bias:<5} {conf:<10} {cat:<22}  {hl}")
+        rf   = f"  [NO-TRADE: {d['rule_flags']}]" if d.get("rule_flags") else ""
+        lines.append(f"#{rank:<3} {tk:<7}{rf} {score:>+7.1f}  {bias:<5} {conf:<10} {cat:<22}  {hl}")
     lines.append("")
     lines.append("-" * 72)
     lines.append("DETAILED NOTES (top 15):")
@@ -1226,6 +1382,8 @@ def build_email_body(ranked: list[tuple]) -> tuple[str, str]:
     rows_html = ""
     for rank, (tk, score, d) in enumerate(ranked, 1):
         bg  = row_color(score)
+        if d.get("rule_flags"):
+            bg = "#e9ecef"   # grey out rule violators -- visibly NO-TRADE
         cat = ", ".join(sorted(d["catalyst_type"]))[:28]
         hl  = (d["headlines"][0][:65] + "...") if d["headlines"] else ""
         conf = d.get("confirmation", "")
@@ -1236,7 +1394,7 @@ def build_email_body(ranked: list[tuple]) -> tuple[str, str]:
         rows_html += f"""
         <tr style="background:{bg}">
           <td style="padding:4px 8px;text-align:right">{rank}</td>
-          <td style="padding:4px 8px;font-weight:bold;font-size:15px">{tk}{flag_badge_html(tk)}</td>
+          <td style="padding:4px 8px;font-weight:bold;font-size:15px">{tk}{flag_badge_html(tk)}{('<span style="background:#6c757d;color:#fff;font-size:9px;padding:1px 5px;border-radius:3px;margin-left:4px;font-weight:normal">NO-TRADE ' + d["rule_flags"] + '</span>') if d.get("rule_flags") else ''}</td>
           <td style="padding:4px 8px;text-align:right">{score:+.1f}</td>
           <td style="padding:4px 8px">{bias_badge(score)}</td>
           <td style="padding:4px 8px">{conf_html}</td>
@@ -1313,7 +1471,11 @@ def send_email(ranked: list[tuple]) -> bool:
         return False
 
     now_str   = now_ct().strftime("%a %b %d %Y")
-    subject   = f"Pre-Market Catalyst Scan  {now_str}  -- Top: " + \
+    # Runs after the 8:30 CT open (the 8:45 / 9:15 re-scans) are intraday
+    # updates, not pre-market -- label them honestly.
+    _t = now_ct()
+    label = "Pre-Market" if (_t.hour, _t.minute) < (8, 30) else "Intraday"
+    subject   = f"{label} Catalyst Scan  {_t.strftime('%I:%M %p CT')}  {now_str}  -- Top: " + \
                 ", ".join(tk for tk, s, d in ranked[:5])
 
     plain, html = build_email_body(ranked)
@@ -1359,6 +1521,7 @@ def main():
 
     print(f"\n{Fore.CYAN}[3/3] Ranking by move potential...{Style.RESET_ALL}\n")
     ranked = rank_tickers(ticker_data)
+    apply_rules_flags(ranked)   # tag <$5 / <$500M rule violations (fails open)
 
     print_results(ranked)
     print_scalp_watchlist(ranked)
