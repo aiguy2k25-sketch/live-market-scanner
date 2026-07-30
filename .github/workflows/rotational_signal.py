@@ -1,5 +1,5 @@
 """
-rotation_signal.py
+../../rotation_signal.py
 ==================
 Equal-weight (RSP) vs cap-weight (SPY) rotation signal for the pre-market
 market-context block of live-market-scanner.
