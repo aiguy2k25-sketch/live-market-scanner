@@ -38,7 +38,7 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
-       run: pip install feedparser requests beautifulsoup4 lxml tabulate colorama tzdata yfinance
+        run: pip install feedparser requests beautifulsoup4 lxml tabulate colorama tzdata yfinance
 
       - name: Run pre-market scanner
         timeout-minutes: 12
