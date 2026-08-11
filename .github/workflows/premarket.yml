@@ -2,45 +2,63 @@ name: Pre-Market Catalyst Scanner
 
 on:
   schedule:
-    # James is in CT, not ET. '0 12' UTC = 7:00 AM CDT, an hour EARLIER than the
-    # intended 8:00 AM CT -- and the report then printed the raw UTC clock with a
-    # hard-coded "CT" label, so it claimed "12:00 PM CT" while actually running
-    # pre-market. Bot now converts properly.
+    # DST-PROOF: GitHub cron is always UTC and ignores daylight saving, so a
+    # fixed UTC time drifts an hour at the CDT<->CST switch. Fix: list BOTH the
+    # CDT and CST UTC slots for each intended local time; the "DST gate" step
+    # runs only the slot matching the current season, so each local time fires
+    # exactly once year-round with no November edits. The gate reads which cron
+    # fired + the current Chicago offset, not the clock, so queue delay is safe.
     #
-    # 2026-07-14: the 13:00 UTC (8:00 CDT) run actually STARTED at ~14:18 UTC
-    # and the "pre-market" email arrived at 9:18 AM CT -- 48 min after the open.
-    # GitHub Actions scheduled workflows queue behind everyone else's, and
-    # on-the-hour slots (:00) are the most congested; 30-80 min delays are
-    # normal. Two mitigations:
-    #   1. Off-peak minute (:12) -- far less queue contention than :00.
-    #   2. Scheduled a ~50-min buffer early (12:12 UTC = 7:12 AM CDT), so even
-    #      a 60-min delay still lands the email before the 8:30 CT open.
-    - cron: '12 12 * * 1-5'
-    # Post-open re-scans targeting ~8:45 and ~9:15 AM CT. GitHub's 20-40 min
-    # typical delay is baked in: nominal 8:22 CDT lands ~8:45-9:00, nominal
-    # 8:52 CDT lands ~9:15-9:30. Off-peak minutes to minimize queue time.
-    - cron: '22 13 * * 1-5'
-    - cron: '52 13 * * 1-5'
-  workflow_dispatch:   # allow manual trigger from GitHub UI
+    # Intended local sends (America/Chicago):
+    #   07:12 pre-market buffer | 08:22 post-open re-scan | 08:52 post-open re-scan
+    #                          CDT(UTC-5) / CST(UTC-6)
+    - cron: '12 12 * * 1-5'   # 07:12 CT -> summer
+    - cron: '12 13 * * 1-5'   # 07:12 CT -> winter
+    - cron: '22 13 * * 1-5'   # 08:22 CT -> summer
+    - cron: '22 14 * * 1-5'   # 08:22 CT -> winter
+    - cron: '52 13 * * 1-5'   # 08:52 CT -> summer
+    - cron: '52 14 * * 1-5'   # 08:52 CT -> winter
+  workflow_dispatch:
 
 jobs:
   premarket-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - name: DST gate (run only the in-season slot)
+        id: gate
+        run: |
+          set -euo pipefail
+          SCHED="${{ github.event.schedule }}"
+          OFFSET="$(TZ=America/Chicago date +%z)"
+          echo "Chicago offset: $OFFSET | cron: '${SCHED:-<manual>}'"
+          if [ -z "$SCHED" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          MH="$(printf '%s' "$SCHED" | awk '{print $1, $2}')"   # "minute hour" UTC
+          CDT_SLOTS=";12 12;22 13;52 13;"
+          CST_SLOTS=";12 13;22 14;52 14;"
+          if [ "$OFFSET" = "-0500" ]; then WANT="$CDT_SLOTS"; else WANT="$CST_SLOTS"; fi
+          case "$WANT" in
+            *";$MH;"*) echo "In-season -> running.";  echo "run=true"  >> "$GITHUB_OUTPUT" ;;
+            *)         echo "Off-season -> skipping."; echo "run=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
       - name: Checkout
+        if: steps.gate.outputs.run == 'true'
         uses: actions/checkout@v4
 
       - name: Set up Python
+        if: steps.gate.outputs.run == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: 'pip'
 
       - name: Install dependencies
+        if: steps.gate.outputs.run == 'true'
         run: pip install feedparser requests beautifulsoup4 lxml tabulate colorama tzdata yfinance
 
       - name: Run pre-market scanner
+        if: steps.gate.outputs.run == 'true'
         timeout-minutes: 12
         env:
           EMAIL_TO:  2daysale@gmail.com
@@ -53,8 +71,8 @@ jobs:
           python premarket_bot.py
 
       - name: Upload scan results
+        if: steps.gate.outputs.run == 'true' && !cancelled()
         uses: actions/upload-artifact@v4
-        if: always()
         with:
           name: premarket-scan-${{ github.run_number }}
           path: premarket/scan_*.txt
