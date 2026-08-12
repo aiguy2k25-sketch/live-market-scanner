@@ -19,7 +19,7 @@ on:
     - cron: '22 13 * * 1-5'   # 08:22 CT post-open  -> summer
     - cron: '22 14 * * 1-5'   # 08:22 CT post-open  -> winter
     - cron: '52 13 * * 1-5'   # 08:52 CT post-open  -> summer
-    - cron: '52 14 * * 1-5'   # 08:52 CT post-open  -> winterr
+    - cron: '52 14 * * 1-5'   # 08:52 CT post-open  -> winter
   workflow_dispatch:
 
 jobs:
@@ -36,8 +36,8 @@ jobs:
           echo "Chicago offset: $OFFSET | cron: '${SCHED:-<manual>}'"
           if [ -z "$SCHED" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
           MH="$(printf '%s' "$SCHED" | awk '{print $1, $2}')"   # "minute hour" UTC
-         CDT_SLOTS=";40 11;5 12;22 13;52 13;"
-         CST_SLOTS=";40 12;5 13;22 14;52 14;"
+          CDT_SLOTS=";40 11;5 12;22 13;52 13;"
+          CST_SLOTS=";40 12;5 13;22 14;52 14;"
           if [ "$OFFSET" = "-0500" ]; then WANT="$CDT_SLOTS"; else WANT="$CST_SLOTS"; fi
           case "$WANT" in
             *";$MH;"*) echo "In-season -> running.";  echo "run=true"  >> "$GITHUB_OUTPUT" ;;
