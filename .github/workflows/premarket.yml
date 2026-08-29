@@ -6,20 +6,25 @@ on:
     # fixed UTC time drifts an hour at the CDT<->CST switch. Fix: list BOTH the
     # CDT and CST UTC slots for each intended local time; the "DST gate" step
     # runs only the slot matching the current season, so each local time fires
-    # exactly once year-round with no November edits. The gate reads which cron
-    # fired + the current Chicago offset, not the clock, so queue delay is safe.
+    # exactly once year-round with no November edits.
+    #
+    # TRIMMED 2026-08-29: was 4 intended times / 8 cron entries. GitHub
+    # deprioritises `schedule` events under load -- these were being delivered
+    # 9-10 HOURS late on Aug 27-28 -- and every queued entry is more exposure
+    # to that backlog. Cut to 2 intended times / 4 entries.
+    #
+    # TO ADD A TIME BACK you must do BOTH:
+    #   1. add its two UTC slots here, and
+    #   2. add a matching arm to the slot table in the gate step below.
+    # A cron with no table entry is treated as unknown and skipped (loudly).
     #
     # Intended local sends (America/Chicago):
-    #   07:12 pre-market buffer | 08:22 post-open re-scan | 08:52 post-open re-scan
+    #   07:05 pre-market  |  08:52 post-open re-scan
     #                          CDT(UTC-5) / CST(UTC-6)
-    - cron: '40 11 * * 1-5'   # 06:40 CT pre-market -> summer
-    - cron: '40 12 * * 1-5'   # 06:40 CT pre-market -> winter
-    - cron: '5 12 * * 1-5'    # 07:05 CT backup     -> summer
-    - cron: '5 13 * * 1-5'    # 07:05 CT backup     -> winter
-    - cron: '22 13 * * 1-5'   # 08:22 CT post-open  -> summer
-    - cron: '22 14 * * 1-5'   # 08:22 CT post-open  -> winter
-    - cron: '52 13 * * 1-5'   # 08:52 CT post-open  -> summer
-    - cron: '52 14 * * 1-5'   # 08:52 CT post-open  -> winter
+    - cron: '5 12 * * 1-5'    # 07:05 CT -> summer
+    - cron: '5 13 * * 1-5'    # 07:05 CT -> winter
+    - cron: '52 13 * * 1-5'   # 08:52 CT -> summer
+    - cron: '52 14 * * 1-5'   # 08:52 CT -> winter
   workflow_dispatch:
 
 jobs:
@@ -27,22 +32,83 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: DST gate (run only the in-season slot)
+      - name: DST gate + freshness check
         id: gate
+        env:
+          # Minutes past the slot's intended local time before the email
+          # subject gets a [STALE +XhYYm] stamp. Cosmetic only -- the scan
+          # still runs and the mail still sends.
+          STALE_AFTER_MIN: "30"
+          # Hard skip threshold, in minutes. 0 = never skip on lateness, on
+          # the theory that a late scan still beats silence. Set to e.g. 240
+          # if you would rather get nothing than a 4h-old "pre-market" scan.
+          HARD_SKIP_MIN: "0"
         run: |
           set -euo pipefail
           SCHED="${{ github.event.schedule }}"
           OFFSET="$(TZ=America/Chicago date +%z)"
-          echo "Chicago offset: $OFFSET | cron: '${SCHED:-<manual>}'"
-          if [ -z "$SCHED" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          NOW_LOCAL="$(TZ=America/Chicago date +%H:%M)"
+          echo "Chicago now: $NOW_LOCAL ($OFFSET) | cron: '${SCHED:-<manual>}'"
+
+          # Manual dispatch always runs, and never gets a staleness stamp.
+          if [ -z "$SCHED" ]; then
+            echo "Manual dispatch -> running."
+            {
+              echo "run=true"
+              echo "late_min=0"
+              echo "slot_ct=manual"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           MH="$(printf '%s' "$SCHED" | awk '{print $1, $2}')"   # "minute hour" UTC
-          CDT_SLOTS=";40 11;5 12;22 13;52 13;"
-          CST_SLOTS=";40 12;5 13;22 14;52 14;"
-          if [ "$OFFSET" = "-0500" ]; then WANT="$CDT_SLOTS"; else WANT="$CST_SLOTS"; fi
-          case "$WANT" in
-            *";$MH;"*) echo "In-season -> running.";  echo "run=true"  >> "$GITHUB_OUTPUT" ;;
-            *)         echo "Off-season -> skipping."; echo "run=false" >> "$GITHUB_OUTPUT" ;;
+
+          # Slot table: UTC "minute hour" -> intended local time + which season
+          # that slot belongs to. Keep in sync with the cron list above.
+          case "$MH" in
+            "5 12")   SLOT_CT="07:05"; SEASON="CDT" ;;
+            "5 13")   SLOT_CT="07:05"; SEASON="CST" ;;
+            "52 13")  SLOT_CT="08:52"; SEASON="CDT" ;;
+            "52 14")  SLOT_CT="08:52"; SEASON="CST" ;;
+            *)
+              echo "Unknown slot '$MH' -- cron added without a table entry."
+              echo "::warning title=Unknown cron slot::'$MH' has no entry in the gate slot table, so the run was skipped. Add an arm to the case statement in premarket.yml."
+              { echo "run=false"; echo "late_min=0"; echo "slot_ct=unknown"; } >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
           esac
+
+          # In-season check: -0500 = CDT (summer), -0600 = CST (winter).
+          if [ "$OFFSET" = "-0500" ]; then NOW_SEASON="CDT"; else NOW_SEASON="CST"; fi
+          if [ "$SEASON" != "$NOW_SEASON" ]; then
+            echo "Off-season slot ($SEASON slot, currently $NOW_SEASON) -> skipping."
+            { echo "run=false"; echo "late_min=0"; echo "slot_ct=$SLOT_CT"; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # --- Freshness: how late did GitHub actually deliver this one? -----
+          NOW_M=$(printf '%s' "$NOW_LOCAL" | awk -F: '{print ($1*60)+$2}')
+          SLOT_M=$(printf '%s' "$SLOT_CT"  | awk -F: '{print ($1*60)+$2}')
+          LATE=$(( NOW_M - SLOT_M ))
+          if [ "$LATE" -lt -60 ]; then LATE=$(( LATE + 1440 )); fi   # midnight wrap
+          if [ "$LATE" -lt 0 ]; then LATE=0; fi                      # ran a touch early
+          echo "Slot $SLOT_CT CT ($SEASON) -- delivered $LATE min late."
+
+          if [ "$HARD_SKIP_MIN" -gt 0 ] && [ "$LATE" -gt "$HARD_SKIP_MIN" ]; then
+            echo "::warning title=Scan skipped (too stale)::Slot $SLOT_CT CT fired ${LATE} min late (now $NOW_LOCAL CT), past HARD_SKIP_MIN=$HARD_SKIP_MIN."
+            echo "### Skipped -- ${LATE} min late (slot ${SLOT_CT} CT)" >> "$GITHUB_STEP_SUMMARY"
+            { echo "run=false"; echo "late_min=$LATE"; echo "slot_ct=$SLOT_CT"; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$LATE" -ge "$STALE_AFTER_MIN" ]; then
+            echo "::warning title=Scheduler backlog::Slot $SLOT_CT CT ran ${LATE} min late (now $NOW_LOCAL CT). The email subject will be stamped [STALE]."
+            echo "### :warning: ${LATE} min late -- slot ${SLOT_CT} CT, ran ${NOW_LOCAL} CT" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### On time -- slot ${SLOT_CT} CT (+${LATE}m)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          { echo "run=true"; echo "late_min=$LATE"; echo "slot_ct=$SLOT_CT"; } >> "$GITHUB_OUTPUT"
 
       - name: Checkout
         if: steps.gate.outputs.run == 'true'
@@ -68,6 +134,14 @@ jobs:
           SMTP_PORT: "587"
           SMTP_USER: 2daysale@gmail.com
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          # Freshness context handed to the bot for the subject-line stamp.
+          SCAN_LATE_MIN:   ${{ steps.gate.outputs.late_min }}
+          SCAN_SLOT_CT:    ${{ steps.gate.outputs.slot_ct }}
+          STALE_AFTER_MIN: "30"
+          # Fail the job if the mail does not go out. Without this the SMTP
+          # error is swallowed and the run stays green with an empty inbox --
+          # the exact failure mode that hid the daily-scan auth break.
+          REQUIRE_EMAIL: "1"
         run: |
           cd premarket
           python premarket_bot.py
