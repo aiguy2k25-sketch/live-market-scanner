@@ -1527,20 +1527,40 @@ def build_email_body(ranked: list[tuple]) -> tuple[str, str]:
     return plain, html
 
 
+def _late_stamp() -> str:
+    """Subject-line staleness stamp, driven by the workflow's DST gate.
+    SCAN_LATE_MIN = minutes GitHub delivered the cron late; STALE_AFTER_MIN =
+    threshold. Empty string when on time or when running outside Actions."""
+    try:
+        late  = int(os.environ.get("SCAN_LATE_MIN", "0") or 0)
+        stale = int(os.environ.get("STALE_AFTER_MIN", "30") or 30)
+    except ValueError:
+        return ""
+    if late >= stale > 0:
+        return f"[STALE +{late // 60}h{late % 60:02d}m] "
+    return ""
+
+
 def send_email(ranked: list[tuple]) -> bool:
-    """Send the scan results via SMTP. Returns True on success."""
+    """Send the scan results via SMTP. Returns True on success.
+
+    Never swallows a failure silently: every failure path prints a GitHub
+    Actions ::error:: annotation so it shows on the run summary, and main()
+    exits non-zero when REQUIRE_EMAIL=1 so the run goes RED instead of green."""
     if not SMTP_USER or not SMTP_PASS:
-        print(f"{Fore.YELLOW}[EMAIL] SMTP_USER / SMTP_PASS not set -- skipping email.{Style.RESET_ALL}")
-        print(f"        Set env vars SMTP_USER and SMTP_PASS to enable.")
+        print(f"{Fore.RED}[EMAIL] SMTP_USER / SMTP_PASS not set -- cannot send.{Style.RESET_ALL}")
+        print("::error title=Email not sent::SMTP_PASS secret is empty. In GitHub: Settings > Secrets and variables > Actions > add SMTP_PASS (16-char Gmail App Password, no spaces).")
         return False
 
-    now_str   = now_ct().strftime("%a %b %d %Y")
-    # Runs after the 8:30 CT open (the 8:45 / 9:15 re-scans) are intraday
-    # updates, not pre-market -- label them honestly.
-    _t = now_ct()
+    _t        = now_ct()
+    now_str   = _t.strftime("%a %b %d %Y")
+    # Runs after the 8:30 CT open (the 8:52 re-scan) are intraday updates,
+    # not pre-market -- label them honestly.
     label = "Pre-Market" if (_t.hour, _t.minute) < (8, 30) else "Intraday"
-    subject   = f"{label} Catalyst Scan  {_t.strftime('%I:%M %p CT')}  {now_str}  -- Top: " + \
-                ", ".join(tk for tk, s, d in ranked[:5])
+    slot  = os.environ.get("SCAN_SLOT_CT", "")
+    slot_txt = f" (slot {slot} CT)" if slot and slot not in ("manual", "unknown") else ""
+    subject = f"{_late_stamp()}{label} Catalyst Scan  {_t.strftime('%I:%M %p CT')}  {now_str}{slot_txt}  -- Top: " + \
+              ", ".join(tk for tk, s, d in ranked[:5])
 
     plain, html = build_email_body(ranked)
 
@@ -1551,20 +1571,31 @@ def send_email(ranked: list[tuple]) -> bool:
     msg.attach(MIMEText(plain, "plain"))
     msg.attach(MIMEText(html,  "html"))
 
-    try:
-        print(f"{Fore.CYAN}[EMAIL] Connecting to {SMTP_HOST}:{SMTP_PORT}...{Style.RESET_ALL}")
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-            server.login(SMTP_USER, SMTP_PASS)
-            server.sendmail(SMTP_USER, EMAIL_TO, msg.as_string())
-        print(f"{Fore.GREEN}[EMAIL] Sent successfully to {EMAIL_TO}{Style.RESET_ALL}")
-        return True
-    except smtplib.SMTPAuthenticationError:
-        print(f"{Fore.RED}[EMAIL] Auth failed -- check SMTP_USER and SMTP_PASS (use Gmail App Password){Style.RESET_ALL}")
-    except Exception as e:
-        print(f"{Fore.RED}[EMAIL] Failed: {e}{Style.RESET_ALL}")
+    # Two attempts: transient Gmail/network errors (timeouts, 421/451 greylist)
+    # are common on shared runners. Auth failures are NOT retried -- they will
+    # not fix themselves and retrying just risks a Gmail lockout.
+    attempts = 2
+    for attempt in range(1, attempts + 1):
+        try:
+            print(f"{Fore.CYAN}[EMAIL] Connecting to {SMTP_HOST}:{SMTP_PORT} (attempt {attempt}/{attempts})...{Style.RESET_ALL}")
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                server.login(SMTP_USER, SMTP_PASS)
+                server.sendmail(SMTP_USER, EMAIL_TO, msg.as_string())
+            print(f"{Fore.GREEN}[EMAIL] Sent successfully to {EMAIL_TO}{Style.RESET_ALL}")
+            print(f"        Subject: {subject}")
+            return True
+        except smtplib.SMTPAuthenticationError as e:
+            print(f"{Fore.RED}[EMAIL] Auth failed: {e}{Style.RESET_ALL}")
+            print("::error title=Gmail rejected the login::SMTP_PASS is wrong or revoked. Generate a new Gmail App Password (Google Account > Security > 2-Step Verification > App passwords) and update the SMTP_PASS repo secret.")
+            return False
+        except Exception as e:
+            print(f"{Fore.RED}[EMAIL] Failed (attempt {attempt}): {type(e).__name__}: {e}{Style.RESET_ALL}")
+            if attempt < attempts:
+                time.sleep(20)
+    print(f"::error title=Email not sent::SMTP send to {EMAIL_TO} failed after {attempts} attempts. See the [EMAIL] lines above.")
     return False
 
 
@@ -1590,10 +1621,7 @@ def main():
     print_results(ranked)
     print_scalp_watchlist(ranked)
 
-    # Email results
-    send_email(ranked)
-
-    # Save to file
+    # Save to file FIRST so the artifact is uploaded even if the email fails.
     out_path = f"scan_{now_ct().strftime('%Y%m%d_%H%M')}.txt"
     try:
         with open(out_path, "w", encoding="utf-8") as f:
@@ -1610,6 +1638,15 @@ def main():
         print(f"{Fore.GREEN}Results saved to: {out_path}{Style.RESET_ALL}")
     except Exception as e:
         print(f"{Fore.RED}Could not save file: {e}{Style.RESET_ALL}")
+
+    # Email results. With REQUIRE_EMAIL=1 (set in premarket.yml) a failed send
+    # fails the whole job, so a missing morning email shows up as a RED run in
+    # the Actions tab (and triggers GitHub's failure notification) instead of
+    # a green run and an empty inbox.
+    sent = send_email(ranked)
+    if not sent and os.environ.get("REQUIRE_EMAIL", "0") == "1":
+        print(f"{Fore.RED}[EMAIL] REQUIRE_EMAIL=1 and the email did not go out -- failing the run.{Style.RESET_ALL}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
