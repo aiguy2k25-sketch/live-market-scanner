@@ -25,7 +25,21 @@ on:
     - cron: '5 13 * * 1-5'    # 07:05 CT -> winter
     - cron: '52 13 * * 1-5'   # 08:52 CT -> summer
     - cron: '52 14 * * 1-5'   # 08:52 CT -> winter
+  # PRIMARY TRIGGER (added 2026-09-02): an external cron service (cron-job.org)
+  # POSTs to the workflow_dispatch API at 07:05 / 08:52 CT. Dispatch events
+  # start within seconds -- they are not subject to the `schedule` backlog
+  # that delivered the 07:05 cron 266 min late on Sep 1. The cron entries
+  # above stay as a FALLBACK only; see the dedupe logic in the gate step.
   workflow_dispatch:
+    inputs:
+      slot_ct:
+        description: 'Intended local slot (America/Chicago), e.g. 07:05 or 08:52. Leave blank for an ad-hoc run.'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  actions: read   # gate step lists today's runs to skip duplicate late crons
 
 jobs:
   premarket-scan:
@@ -43,6 +57,7 @@ jobs:
           # the theory that a late scan still beats silence. Set to e.g. 240
           # if you would rather get nothing than a 4h-old "pre-market" scan.
           HARD_SKIP_MIN: "0"
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           SCHED="${{ github.event.schedule }}"
@@ -50,14 +65,26 @@ jobs:
           NOW_LOCAL="$(TZ=America/Chicago date +%H:%M)"
           echo "Chicago now: $NOW_LOCAL ($OFFSET) | cron: '${SCHED:-<manual>}'"
 
-          # Manual dispatch always runs, and never gets a staleness stamp.
+          INPUT_SLOT="${{ github.event.inputs.slot_ct }}"
+
+          # Dispatch (external cron-job.org or the Run-workflow button).
+          # Always runs. If a slot was passed we still compute lateness so a
+          # late-firing external cron gets the [STALE] stamp too.
           if [ -z "$SCHED" ]; then
-            echo "Manual dispatch -> running."
-            {
-              echo "run=true"
-              echo "late_min=0"
-              echo "slot_ct=manual"
-            } >> "$GITHUB_OUTPUT"
+            if [ -z "$INPUT_SLOT" ]; then
+              echo "Ad-hoc manual dispatch -> running."
+              { echo "run=true"; echo "late_min=0"; echo "slot_ct=manual"; } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            SLOT_CT="$INPUT_SLOT"
+            NOW_M=$(printf '%s' "$NOW_LOCAL" | awk -F: '{print ($1*60)+$2}')
+            SLOT_M=$(printf '%s' "$SLOT_CT"  | awk -F: '{print ($1*60)+$2}')
+            LATE=$(( NOW_M - SLOT_M ))
+            if [ "$LATE" -lt -60 ]; then LATE=$(( LATE + 1440 )); fi
+            if [ "$LATE" -lt 0 ]; then LATE=0; fi
+            echo "External dispatch for slot $SLOT_CT CT -- ${LATE} min late -> running."
+            echo "### Dispatch -- slot ${SLOT_CT} CT (+${LATE}m)" >> "$GITHUB_STEP_SUMMARY"
+            { echo "run=true"; echo "late_min=$LATE"; echo "slot_ct=$SLOT_CT"; } >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -94,6 +121,21 @@ jobs:
           if [ "$LATE" -lt 0 ]; then LATE=0; fi                      # ran a touch early
           echo "Slot $SLOT_CT CT ($SEASON) -- delivered $LATE min late."
 
+          # --- Dedupe against the external dispatch trigger -----------------
+          # If cron-job.org already dispatched this slot today, this (probably
+          # late) scheduled copy would just send a duplicate [STALE] email.
+          # Fails open: if the API call breaks, we run anyway.
+          TODAY_CT="$(TZ=America/Chicago date +%Y-%m-%d)"
+          DUP="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/premarket.yml/runs" \
+                   -f event=workflow_dispatch -f "created=>=${TODAY_CT}" -f per_page=5 \
+                   --jq '.total_count' 2>/dev/null || echo 0)"
+          if [ "${DUP:-0}" -gt 0 ] 2>/dev/null; then
+            echo "A workflow_dispatch run already happened today ($DUP found) -> the external trigger covered this slot; skipping the scheduled duplicate."
+            echo "### Skipped -- external dispatch already ran today (slot ${SLOT_CT} CT, cron was ${LATE} min late)" >> "$GITHUB_STEP_SUMMARY"
+            { echo "run=false"; echo "late_min=$LATE"; echo "slot_ct=$SLOT_CT"; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           if [ "$HARD_SKIP_MIN" -gt 0 ] && [ "$LATE" -gt "$HARD_SKIP_MIN" ]; then
             echo "::warning title=Scan skipped (too stale)::Slot $SLOT_CT CT fired ${LATE} min late (now $NOW_LOCAL CT), past HARD_SKIP_MIN=$HARD_SKIP_MIN."
             echo "### Skipped -- ${LATE} min late (slot ${SLOT_CT} CT)" >> "$GITHUB_STEP_SUMMARY"
@@ -112,11 +154,11 @@ jobs:
 
       - name: Checkout
         if: steps.gate.outputs.run == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
         if: steps.gate.outputs.run == 'true'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
           cache: 'pip'
@@ -133,7 +175,7 @@ jobs:
           SMTP_HOST: smtp.gmail.com
           SMTP_PORT: "587"
           SMTP_USER: 2daysale@gmail.com
-          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS || secrets.GMAIL_APP_PASSWORD }}  # fall back to the daily-scan secret
           # Freshness context handed to the bot for the subject-line stamp.
           SCAN_LATE_MIN:   ${{ steps.gate.outputs.late_min }}
           SCAN_SLOT_CT:    ${{ steps.gate.outputs.slot_ct }}
@@ -148,7 +190,7 @@ jobs:
 
       - name: Upload scan results
         if: steps.gate.outputs.run == 'true' && !cancelled()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: premarket-scan-${{ github.run_number }}
           path: premarket/scan_*.txt
