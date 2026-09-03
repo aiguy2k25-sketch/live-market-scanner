@@ -1,5 +1,5 @@
 name: Pre-Market Catalyst Scanner
-
+ 
 on:
   schedule:
     # DST-PROOF: GitHub cron is always UTC and ignores daylight saving, so a
@@ -36,11 +36,11 @@ on:
         description: 'Intended local slot (America/Chicago), e.g. 07:05 or 08:52. Leave blank for an ad-hoc run.'
         required: false
         default: ''
-
+ 
 permissions:
   contents: read
   actions: read   # gate step lists today's runs to skip duplicate late crons
-
+ 
 jobs:
   premarket-scan:
     runs-on: ubuntu-latest
@@ -64,9 +64,9 @@ jobs:
           OFFSET="$(TZ=America/Chicago date +%z)"
           NOW_LOCAL="$(TZ=America/Chicago date +%H:%M)"
           echo "Chicago now: $NOW_LOCAL ($OFFSET) | cron: '${SCHED:-<manual>}'"
-
+ 
           INPUT_SLOT="${{ github.event.inputs.slot_ct }}"
-
+ 
           # Dispatch (external cron-job.org or the Run-workflow button).
           # Always runs. If a slot was passed we still compute lateness so a
           # late-firing external cron gets the [STALE] stamp too.
@@ -77,6 +77,26 @@ jobs:
               exit 0
             fi
             SLOT_CT="$INPUT_SLOT"
+ 
+            # --- Runaway-trigger guard (added 2026-09-02) --------------------
+            # cron-job.org's default schedule is "every 15 minutes"; a job
+            # saved with that default dispatched this workflow ~50 times in
+            # one evening. A slot-tagged dispatch is only legitimate once per
+            # slot per day, so: if ANOTHER dispatch run of this workflow was
+            # created in the last DISPATCH_COOLDOWN_MIN minutes, skip loudly.
+            # Fails open if the API call breaks.
+            DISPATCH_COOLDOWN_MIN=60
+            RECENT="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/premarket.yml/runs" \
+                        -f event=workflow_dispatch -f per_page=10 \
+                        --jq "[.workflow_runs[] | select(.id != ${GITHUB_RUN_ID}) | select((now - (.created_at | fromdateiso8601)) < (${DISPATCH_COOLDOWN_MIN} * 60))] | length" \
+                        2>/dev/null || echo 0)"
+            if [ "${RECENT:-0}" -gt 0 ] 2>/dev/null; then
+              echo "::error title=Runaway trigger::Another dispatch ran within the last ${DISPATCH_COOLDOWN_MIN} min. Your external cron (cron-job.org) is firing too often -- check its Schedule tab (default is every 15 minutes). Skipping this run."
+              echo "### Skipped -- duplicate dispatch within ${DISPATCH_COOLDOWN_MIN} min (slot ${SLOT_CT} CT). Check the cron-job.org schedule." >> "$GITHUB_STEP_SUMMARY"
+              { echo "run=false"; echo "late_min=0"; echo "slot_ct=$SLOT_CT"; } >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+ 
             NOW_M=$(printf '%s' "$NOW_LOCAL" | awk -F: '{print ($1*60)+$2}')
             SLOT_M=$(printf '%s' "$SLOT_CT"  | awk -F: '{print ($1*60)+$2}')
             LATE=$(( NOW_M - SLOT_M ))
@@ -87,9 +107,9 @@ jobs:
             { echo "run=true"; echo "late_min=$LATE"; echo "slot_ct=$SLOT_CT"; } >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
+ 
           MH="$(printf '%s' "$SCHED" | awk '{print $1, $2}')"   # "minute hour" UTC
-
+ 
           # Slot table: UTC "minute hour" -> intended local time + which season
           # that slot belongs to. Keep in sync with the cron list above.
           case "$MH" in
@@ -104,7 +124,7 @@ jobs:
               exit 0
               ;;
           esac
-
+ 
           # In-season check: -0500 = CDT (summer), -0600 = CST (winter).
           if [ "$OFFSET" = "-0500" ]; then NOW_SEASON="CDT"; else NOW_SEASON="CST"; fi
           if [ "$SEASON" != "$NOW_SEASON" ]; then
@@ -112,7 +132,7 @@ jobs:
             { echo "run=false"; echo "late_min=0"; echo "slot_ct=$SLOT_CT"; } >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
+ 
           # --- Freshness: how late did GitHub actually deliver this one? -----
           NOW_M=$(printf '%s' "$NOW_LOCAL" | awk -F: '{print ($1*60)+$2}')
           SLOT_M=$(printf '%s' "$SLOT_CT"  | awk -F: '{print ($1*60)+$2}')
@@ -120,7 +140,7 @@ jobs:
           if [ "$LATE" -lt -60 ]; then LATE=$(( LATE + 1440 )); fi   # midnight wrap
           if [ "$LATE" -lt 0 ]; then LATE=0; fi                      # ran a touch early
           echo "Slot $SLOT_CT CT ($SEASON) -- delivered $LATE min late."
-
+ 
           # --- Dedupe against the external dispatch trigger -----------------
           # If cron-job.org already dispatched this slot today, this (probably
           # late) scheduled copy would just send a duplicate [STALE] email.
@@ -135,38 +155,38 @@ jobs:
             { echo "run=false"; echo "late_min=$LATE"; echo "slot_ct=$SLOT_CT"; } >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
+ 
           if [ "$HARD_SKIP_MIN" -gt 0 ] && [ "$LATE" -gt "$HARD_SKIP_MIN" ]; then
             echo "::warning title=Scan skipped (too stale)::Slot $SLOT_CT CT fired ${LATE} min late (now $NOW_LOCAL CT), past HARD_SKIP_MIN=$HARD_SKIP_MIN."
             echo "### Skipped -- ${LATE} min late (slot ${SLOT_CT} CT)" >> "$GITHUB_STEP_SUMMARY"
             { echo "run=false"; echo "late_min=$LATE"; echo "slot_ct=$SLOT_CT"; } >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
+ 
           if [ "$LATE" -ge "$STALE_AFTER_MIN" ]; then
             echo "::warning title=Scheduler backlog::Slot $SLOT_CT CT ran ${LATE} min late (now $NOW_LOCAL CT). The email subject will be stamped [STALE]."
             echo "### :warning: ${LATE} min late -- slot ${SLOT_CT} CT, ran ${NOW_LOCAL} CT" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "### On time -- slot ${SLOT_CT} CT (+${LATE}m)" >> "$GITHUB_STEP_SUMMARY"
           fi
-
+ 
           { echo "run=true"; echo "late_min=$LATE"; echo "slot_ct=$SLOT_CT"; } >> "$GITHUB_OUTPUT"
-
+ 
       - name: Checkout
         if: steps.gate.outputs.run == 'true'
         uses: actions/checkout@v5
-
+ 
       - name: Set up Python
         if: steps.gate.outputs.run == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: '3.12'
           cache: 'pip'
-
+ 
       - name: Install dependencies
         if: steps.gate.outputs.run == 'true'
         run: pip install feedparser requests beautifulsoup4 lxml tabulate colorama tzdata yfinance
-
+ 
       - name: Run pre-market scanner
         if: steps.gate.outputs.run == 'true'
         timeout-minutes: 12
@@ -187,7 +207,7 @@ jobs:
         run: |
           cd premarket
           python premarket_bot.py
-
+ 
       - name: Upload scan results
         if: steps.gate.outputs.run == 'true' && !cancelled()
         uses: actions/upload-artifact@v5
@@ -195,3 +215,6 @@ jobs:
           name: premarket-scan-${{ github.run_number }}
           path: premarket/scan_*.txt
           retention-days: 30
+ 
+
+
